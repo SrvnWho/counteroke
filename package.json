@@ -1,0 +1,17 @@
+{
+  "name": "counteroke",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev -w server",
+    "dev:web": "npm run dev -w web",
+    "build": "npm run build -w web",
+    "start": "npm start -w server",
+    "test": "npm test -w server && npm test -w web",
+    "check": "npm run check -w server && npm run check -w web"
+  }
+}

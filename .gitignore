@@ -1,0 +1,14 @@
+node_modules/
+web/dist/
+data/
+models/
+worker/.venv/
+worker/.venv-*/
+__pycache__/
+*.pyc
+.env
+*.log
+# machine-specific (paths on this PC)
+.claude/
+# real WORKER_TOKEN / GAME_PASSWORD: never commit
+counteroke.secrets.json
