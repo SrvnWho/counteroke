@@ -74,9 +74,9 @@ socket.on('connect', () => {
   }
 });
 
-export function join(name: string, password: string): Promise<void> {
+export function join(name: string, password: string, avatar?: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    socket.timeout(10_000).emit('join', { name, password }, (err: Error | null, ack: Ack<JoinResult>) => {
+    socket.timeout(10_000).emit('join', { name, password, avatar }, (err: Error | null, ack: Ack<JoinResult>) => {
       if (err) return reject(new Error('Sunucu cevap vermedi'));
       if (!ack.ok) return reject(new Error(ack.error));
       setSession(ack.data!);

@@ -50,6 +50,24 @@ export interface PlayerView {
   score: number;
   connected: boolean;
   color: string;
+  avatar: string;
+}
+
+/** A video from the suggestion playlist. */
+export interface Suggestion {
+  youtubeId: string;
+  title: string;
+  /** seconds, when the playlist listing included it */
+  duration: number | null;
+}
+
+export interface PlaylistView {
+  url: string;
+  title?: string;
+  status: 'loading' | 'ready' | 'error';
+  error?: string;
+  /** usable videos in the list */
+  count: number;
 }
 
 export interface SubmissionView {
@@ -135,12 +153,17 @@ export interface GameView {
   workerOnline: boolean;
   passwordRequired: boolean;
   maxClipSeconds: number;
+  /** playlist the "no idea?" suggestions come from, set by the host */
+  playlist: PlaylistView | null;
 }
 
 /** Everything a client can ask the server to do, sent over the `action` socket event. */
 export type Action =
   | { type: 'startGame' }
-  | { type: 'rename'; name: string }
+  | { type: 'setProfile'; name: string; avatar: string }
+  | { type: 'setPlaylist'; url: string }
+  /** answers with SuggestResult; `exclude` = ids the player has already been shown */
+  | { type: 'suggest'; exclude?: string[] }
   | { type: 'removePlayer'; playerId: string }
   | { type: 'resetGame' }
   | { type: 'submitVideo'; url: string; start: number; end: number; speakers: number; lang: Lang }
@@ -178,8 +201,13 @@ export interface JoinResult {
   secret: string;
 }
 
+export interface SuggestResult {
+  items: Suggestion[];
+}
+
 /** A processing job handed to a worker. */
 export interface WorkerJob {
+  kind?: 'clip';
   id: string;
   youtubeId: string;
   url: string;
@@ -187,4 +215,11 @@ export interface WorkerJob {
   end: number;
   lang: Lang;
   speakers: number;
+}
+
+/** Asks a worker to list a playlist's videos (only sent to workers that said they can). */
+export interface PlaylistTask {
+  kind: 'playlist';
+  id: string;
+  url: string;
 }

@@ -13,6 +13,7 @@ import { Recording } from './screens/Recording.tsx';
 import { Mixing } from './screens/Mixing.tsx';
 import { Screening } from './screens/Screening.tsx';
 import { Results } from './screens/Results.tsx';
+import { ProfileDialog } from './Profile.tsx';
 import { Avatar, Logo } from './ui.tsx';
 
 function useGameState(): { g: GameView | null; connected: boolean } {
@@ -58,8 +59,10 @@ function Toasts() {
 
 function TopBar({ g, connected }: { g: GameView; connected: boolean }) {
   const players = [...g.players].sort((a, b) => b.score - a.score);
+  const [editing, setEditing] = useState(false);
   return (
     <header className="topbar">
+      {editing && <ProfileDialog g={g} onClose={() => setEditing(false)} />}
       <Logo />
       <div className="clapper">
         <div className="clapper-top" />
@@ -69,18 +72,28 @@ function TopBar({ g, connected }: { g: GameView; connected: boolean }) {
         </div>
       </div>
       <div className="players-strip">
-        {players.map((p) => (
-          <span
-            key={p.id}
-            className={`pchip ${p.connected ? '' : 'offline'} ${p.id === g.me?.id ? 'me' : ''}`}
-            title={p.connected ? 'Bağlı' : 'Bağlantı yok'}
-          >
-            <Avatar g={g} p={p} size={28} />
-            {p.name}
-            {p.isHost && <span title="Oda sahibi">👑</span>}
-            <b className="pscore">{Number.isInteger(p.score) ? p.score : p.score.toFixed(1)}</b>
-          </span>
-        ))}
+        {players.map((p) => {
+          const body = (
+            <>
+              <Avatar g={g} p={p} size={28} />
+              {p.name}
+              {p.isHost && <span title="Oda sahibi">👑</span>}
+              <b className="pscore">{Number.isInteger(p.score) ? p.score : p.score.toFixed(1)}</b>
+            </>
+          );
+          return p.id === g.me?.id ? (
+            <button key={p.id} className="pchip me" title="Adını ya da avatarını değiştir" onClick={() => setEditing(true)}>
+              {body}
+              <span className="pchip-edit" aria-hidden>
+                ✏️
+              </span>
+            </button>
+          ) : (
+            <span key={p.id} className={`pchip ${p.connected ? '' : 'offline'}`} title={p.connected ? 'Bağlı' : 'Bağlantı yok'}>
+              {body}
+            </span>
+          );
+        })}
       </div>
       <div className="status">
         <span className="conn" title={connected ? 'Sunucuya bağlı' : 'Bağlantı koptu'}>

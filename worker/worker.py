@@ -26,6 +26,8 @@ import pipeline
 HINTS = {
     "Sign in to confirm": "YouTube bu bağlantıdan bot kontrolü istedi; biraz sonra tekrar dene ya da başka video seç.",
     "Video unavailable": "Video kaldırılmış ya da erişilemiyor.",
+    "playlist does not exist": "Böyle bir oynatma listesi yok ya da gizli.",
+    "The playlist does not exist": "Böyle bir oynatma listesi yok ya da gizli.",
     "Private video": "Video gizli.",
     "age": "Video yaş kısıtlamalı, indirilemiyor.",
 }
@@ -43,6 +45,7 @@ def friendly(e: Exception) -> str:
         "transcribe": "Yazıya çevirme hatası",
         "diarize": "Konuşmacı ayırma hatası",
         "finalize": "Video hazırlama hatası",
+        "playlist": "Liste okunamadı",
     }.get(stage, "Hata")
     return f"{prefix}: {text[-400:]}"
 
@@ -82,6 +85,20 @@ def handle(session: requests.Session, server: str, job: dict) -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def handle_playlist(session: requests.Session, server: str, task: dict) -> None:
+    print(f"[worker] öneri listesi okunuyor: {task['url']}")
+    try:
+        body = pipeline.list_playlist(task["url"])
+        print(f"[worker] listede {len(body['items'])} video bulundu")
+    except Exception as e:
+        traceback.print_exc()
+        body = {"error": friendly(e)}
+    try:
+        session.post(f"{server}/api/worker/playlist/{task['id']}", json=body, timeout=30).raise_for_status()
+    except requests.RequestException as e:
+        print(f"[worker] liste sunucuya gönderilemedi: {e}")
+
+
 def clean_temp(max_age_hours: float = 6) -> None:
     """Removes working folders left behind by jobs that were cut off (crash, closed window)."""
     cutoff = time.time() - max_age_hours * 3600
@@ -107,7 +124,8 @@ def serve(args: argparse.Namespace) -> None:
     warned = False
     while True:
         try:
-            r = session.get(f"{server}/api/worker/next", params={"name": args.name, "fast": "1" if fast else "0"}, timeout=20)
+            params = {"name": args.name, "fast": "1" if fast else "0", "caps": "playlist"}
+            r = session.get(f"{server}/api/worker/next", params=params, timeout=20)
         except requests.RequestException as e:
             if not warned:
                 print(f"[worker] sunucuya ulaşılamıyor, tekrar denenecek: {e}")
@@ -126,7 +144,11 @@ def serve(args: argparse.Namespace) -> None:
             print(f"[worker] sunucu hatası {r.status_code}: {r.text[:200]}")
             time.sleep(5)
             continue
-        handle(session, server, r.json())
+        task = r.json()
+        if task.get("kind") == "playlist":
+            handle_playlist(session, server, task)
+        else:
+            handle(session, server, task)
 
 
 def test(args: argparse.Namespace) -> None:

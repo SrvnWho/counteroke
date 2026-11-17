@@ -3,6 +3,8 @@
 Arkadaşlarla tarayıcıda oynanan bir seslendirme (dublaj) parti oyunu.
 
 1. Herkes bir YouTube linki önerir, başlangıç/bitiş saniyesini, kaç kişinin konuştuğunu ve dili seçer.
+   Aklına video gelmeyen, oda sahibinin Kulis'te verdiği oynatma listesinden gelen iki videodan birini
+   seçebilir ya da "Başka iki tane" ile yenilerini getirebilir (listeyi worker yt-dlp ile okur).
 2. Oylamayla bir video seçilir (kendi videona oy veremezsin, videosu seçilen +1 puan alır).
 3. Sunucu videodaki **konuşmaları siler, müzik ve efektleri bırakır**, konuşmaları yazıya çevirir ve
    karakterlere böler. Senaryo ekranında herkes metni ve konuşmacıları düzeltebilir.

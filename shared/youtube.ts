@@ -24,6 +24,27 @@ export function parseYouTubeId(input: string): string | null {
   return id && ID_RE.test(id) ? id : null;
 }
 
+const LIST_RE = /^[A-Za-z0-9_-]{12,64}$/;
+
+/** Pulls the playlist id (`list=`) out of a YouTube link, or accepts a bare id. */
+export function parsePlaylistId(input: string): string | null {
+  const raw = input.trim();
+  if (LIST_RE.test(raw) && /^(PL|UU|FL|OL|LL|RD)/.test(raw)) return raw;
+  try {
+    const url = new URL(raw.startsWith('http') ? raw : `https://${raw}`);
+    const host = url.hostname.replace(/^www\.|^m\.|^music\./, '');
+    if (host !== 'youtube.com' && host !== 'youtu.be') return null;
+    const list = url.searchParams.get('list');
+    return list && LIST_RE.test(list) ? list : null;
+  } catch {
+    return null;
+  }
+}
+
+export function playlistUrl(listId: string): string {
+  return `https://www.youtube.com/playlist?list=${listId}`;
+}
+
 export function watchUrl(id: string): string {
   return `https://www.youtube.com/watch?v=${id}`;
 }

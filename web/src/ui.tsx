@@ -1,15 +1,8 @@
 import type { CSSProperties, ReactNode } from 'react';
+import { AVATARS } from '../../shared/constants.ts';
 import type { GameView, PlayerView } from '../../shared/types.ts';
 
-const ANIMALS = ['🦊', '🐸', '🐙', '🐼', '🦁', '🐯', '🐨', '🐵', '🦄', '🐔', '🐧', '🐢', '🦖', '🐳', '🦉', '🐰', '🐷', '🐮', '🐻', '🐲'];
-
-/** Each player gets an animal by join order, so everyone sees the same one. */
-export function animalOf(g: GameView, playerId: string): string {
-  const i = g.players.findIndex((p) => p.id === playerId);
-  return ANIMALS[(i < 0 ? 0 : i) % ANIMALS.length];
-}
-
-export function Avatar({ g, p, size = 34 }: { g: GameView; p: PlayerView | undefined; size?: number }) {
+export function Avatar({ p, size = 34 }: { g?: GameView; p: PlayerView | undefined; size?: number }) {
   if (!p) return null;
   return (
     <span
@@ -17,9 +10,54 @@ export function Avatar({ g, p, size = 34 }: { g: GameView; p: PlayerView | undef
       style={{ background: p.color, width: size, height: size, fontSize: Math.round(size * 0.58) }}
       title={p.name}
     >
-      {animalOf(g, p.id)}
+      {p.avatar}
     </span>
   );
+}
+
+/** Grid of avatars; the ones other players already have are greyed out. */
+export function AvatarPicker({
+  g,
+  value,
+  onChange,
+  selfId,
+}: {
+  g: GameView;
+  value: string;
+  onChange: (avatar: string) => void;
+  /** the player choosing (their own current avatar is not "taken") */
+  selfId?: string;
+}) {
+  const takenBy = new Map(g.players.filter((p) => p.id !== selfId).map((p) => [p.avatar, p.name]));
+  return (
+    <div className="avatar-picker" role="radiogroup" aria-label="Avatar">
+      {AVATARS.map((a) => {
+        const owner = takenBy.get(a);
+        return (
+          <button
+            key={a}
+            type="button"
+            role="radio"
+            aria-checked={value === a}
+            className={value === a ? 'on' : ''}
+            disabled={!!owner}
+            title={owner ? `${owner} aldı` : undefined}
+            onClick={() => onChange(a)}
+          >
+            {a}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** A random avatar nobody has yet (for the join screen). */
+export function randomFreeAvatar(g: GameView, selfId?: string): string {
+  const taken = new Set(g.players.filter((p) => p.id !== selfId).map((p) => p.avatar));
+  const free = AVATARS.filter((a) => !taken.has(a));
+  const pool = free.length ? free : AVATARS;
+  return pool[Math.floor(Math.random() * pool.length)];
 }
 
 /** Avatar + name in a little pill. */

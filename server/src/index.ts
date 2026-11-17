@@ -59,9 +59,9 @@ io.on('connection', (socket) => {
     } else ack?.({ ok: false, error: 'Oturum bulunamadı' });
   });
 
-  socket.on('join', (p: { name?: string; password?: string }, ack: (a: Ack<JoinResult>) => void) => {
+  socket.on('join', (p: { name?: string; password?: string; avatar?: string }, ack: (a: Ack<JoinResult>) => void) => {
     try {
-      const result = game.join(p?.name, p?.password);
+      const result = game.join(p?.name, p?.password, p?.avatar);
       attach(socket, result.playerId);
       ack?.({ ok: true, data: result });
     } catch (e) {
@@ -170,10 +170,15 @@ function wrap(fn: (req: Request, res: Response) => unknown | Promise<unknown>) {
 }
 
 app.get('/api/worker/next', workerAuth, (req, res) => {
-  const job = game.nextJob(String(req.query.name ?? 'worker').slice(0, 40), req.query.fast === '1');
+  const caps = String(req.query.caps ?? '').split(',');
+  const job = game.nextJob(String(req.query.name ?? 'worker').slice(0, 40), req.query.fast === '1', caps.includes('playlist'));
   if (job) res.json(job);
   else res.status(204).end();
 });
+
+app.post('/api/worker/playlist/:id', workerAuth, express.json({ limit: '2mb' }), wrap((req) => {
+  game.playlistResult(String(req.params.id), req.body ?? {});
+}));
 
 app.post('/api/worker/jobs/:id/progress', workerAuth, express.json(), wrap((req) => {
   game.jobProgress(String(req.params.id), req.body?.stage, req.body?.progress);

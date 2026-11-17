@@ -27,6 +27,13 @@ export const PLAYER_COLORS = [
   '#4d96ff', '#ff9f43', '#00d2d3', '#c56cf0', '#f8a5c2', '#7bed9f',
 ];
 
+/** Avatars players pick from. Each one can be used by only one player at a time. */
+export const AVATARS = [
+  '🦊', '🐸', '🐙', '🐼', '🦁', '🐯', '🐨', '🐵', '🦄', '🐔',
+  '🐧', '🐢', '🦖', '🐳', '🦉', '🐰', '🐷', '🐮', '🐻', '🐲',
+  '🐱', '🐶', '🦝', '🦦', '🦩', '🐝', '🦀', '👽', '🤖', '👻',
+];
+
 export const PHASE_LABELS = {
   lobby: 'Kulis',
   submit: 'Video seçimi',

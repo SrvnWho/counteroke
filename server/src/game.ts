@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { EFFECT_IDS, MAX_SPEAKERS, PLAYER_COLORS } from '../../shared/constants.ts';
+import { AVATARS, EFFECT_IDS, MAX_SPEAKERS, PLAYER_COLORS } from '../../shared/constants.ts';
 import type { EffectId } from '../../shared/constants.ts';
 import type {
   Action,
@@ -13,17 +13,21 @@ import type {
   Lang,
   Phase,
   PlayerView,
+  PlaylistTask,
+  PlaylistView,
   RoundView,
   Script,
   ScriptLine,
   SubmissionView,
+  Suggestion,
+  SuggestResult,
   WorkerJob,
 } from '../../shared/types.ts';
 import { config } from './config.ts';
 import { characterLoads, defaultEffects, distributeRoles, makeGroups, shuffle } from './grouping.ts';
 import { mixGroup } from './mix.ts';
 import type { Track } from './mix.ts';
-import { fetchTitle, parseYouTubeId, watchUrl } from '../../shared/youtube.ts';
+import { fetchTitle, parsePlaylistId, parseYouTubeId, playlistUrl, watchUrl } from '../../shared/youtube.ts';
 
 /** An error whose message is shown to the player as-is. */
 export class GameError extends Error {}
@@ -35,6 +39,7 @@ interface Player {
   isHost: boolean;
   score: number;
   color: string;
+  avatar: string;
   joinedAt: number;
 }
 
@@ -113,6 +118,20 @@ interface Round {
   winnerGroupIds?: string[];
 }
 
+/** The host's suggestion playlist; a worker reads its video list with yt-dlp. */
+interface Playlist {
+  url: string;
+  listId: string;
+  title?: string;
+  status: PlaylistView['status'];
+  error?: string;
+  items: Suggestion[];
+  /** set while the list still has to be (re)read */
+  taskId?: string;
+  claimedAt?: number;
+  readAt?: number;
+}
+
 interface State {
   phase: Phase;
   players: Player[];
@@ -120,11 +139,17 @@ interface State {
   round: Round | null;
   roundCounter: number;
   jobs: Job[];
+  playlist?: Playlist;
+  /** youtube ids of videos already played, so suggestions skip them */
+  played?: string[];
 }
 
 const WORKER_ONLINE_MS = 15_000;
 const STALE_JOB_MS = 10 * 60_000;
 const SELECTION_BONUS = 1;
+const PLAYLIST_TASK_MS = 2 * 60_000;
+/** re-read the playlist after this long, so videos added to it show up */
+const PLAYLIST_REFRESH_MS = 24 * 3600_000;
 
 function freshState(): State {
   return { phase: 'lobby', players: [], submissions: [], round: null, roundCounter: 0, jobs: [] };
@@ -142,6 +167,21 @@ function clampInt(n: unknown, min: number, max: number): number {
 
 function cleanText(s: unknown, max: number): string {
   return String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+/** State writes run one at a time, so a slow disk never has two writers on the same temp file. */
+let saveChain: Promise<void> = Promise.resolve();
+
+/** First avatar nobody else has, starting from the player's seat so newcomers get different ones. */
+function freeAvatar(players: { id: string; avatar?: string }[], playerId: string): string {
+  const used = new Set(players.filter((p) => p.id !== playerId && p.avatar).map((p) => p.avatar));
+  const seat = players.findIndex((p) => p.id === playerId);
+  const from = (seat < 0 ? players.length : seat) % AVATARS.length;
+  for (let i = 0; i < AVATARS.length; i++) {
+    const a = AVATARS[(from + i) % AVATARS.length];
+    if (!used.has(a)) return a;
+  }
+  return AVATARS[from];
 }
 
 export class Game {
@@ -168,6 +208,12 @@ export class Game {
       return freshState();
     }
     for (const j of s.jobs) if (j.status === 'claimed') j.status = 'queued';
+    for (const p of s.players) if (!p.avatar) p.avatar = freeAvatar(s.players, p.id);
+    const pl = s.playlist;
+    if (pl) {
+      delete pl.claimedAt;
+      if (!pl.taskId && Date.now() - (pl.readAt ?? 0) > PLAYLIST_REFRESH_MS) pl.taskId = randomUUID();
+    }
     const r = s.round;
     if (r) {
       if (r.clip?.status === 'processing') r.clip.status = 'queued';
@@ -185,36 +231,47 @@ export class Game {
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
-      const tmp = `${config.stateFile}.tmp`;
-      fs.writeFile(tmp, JSON.stringify(this.state), (err) => {
-        if (err) return console.error('state kaydedilemedi', err);
-        fs.rename(tmp, config.stateFile, (e) => e && console.error('state kaydedilemedi', e));
-      });
+      saveChain = saveChain.then(() => this.save());
     }, 300);
+  }
+
+  private async save(): Promise<void> {
+    const tmp = `${config.stateFile}.tmp`;
+    try {
+      await fs.promises.writeFile(tmp, JSON.stringify(this.state));
+      await fs.promises.rename(tmp, config.stateFile);
+    } catch (e) {
+      console.error('state kaydedilemedi', e);
+    }
   }
 
   // ---------------------------------------------------------------- players
 
-  join(nameRaw: unknown, password: unknown): JoinResult {
+  join(nameRaw: unknown, password: unknown, avatarRaw?: unknown): JoinResult {
     if (config.gamePassword && password !== config.gamePassword) throw new GameError('Şifre yanlış');
     const name = cleanText(nameRaw, 20);
     if (!name) throw new GameError('Bir isim yaz');
     const secret = randomBytes(18).toString('base64url');
-    const existing = this.state.players.find((p) => p.name.toLocaleLowerCase('tr') === name.toLocaleLowerCase('tr'));
+    const players = this.state.players;
+    const wanted = typeof avatarRaw === 'string' && AVATARS.includes(avatarRaw) ? avatarRaw : null;
+    const existing = players.find((p) => p.name.toLocaleLowerCase('tr') === name.toLocaleLowerCase('tr'));
     if (existing) {
       if (this.isConnected(existing.id)) throw new GameError('Bu isim şu an oyunda, başka bir isim seç');
       // Same name, nobody using it: take that seat back (e.g. after clearing the browser).
       existing.secret = secret;
+      if (wanted && !this.avatarTaken(wanted, existing.id)) existing.avatar = wanted;
       this.changed();
       return { playerId: existing.id, secret };
     }
+    const id = randomUUID();
     const player: Player = {
-      id: randomUUID(),
+      id,
       secret,
       name,
-      isHost: !this.state.players.some((p) => p.isHost),
+      isHost: !players.some((p) => p.isHost),
       score: 0,
-      color: PLAYER_COLORS[this.state.players.length % PLAYER_COLORS.length],
+      color: PLAYER_COLORS[players.length % PLAYER_COLORS.length],
+      avatar: wanted && !this.avatarTaken(wanted, id) ? wanted : freeAvatar(players, id),
       joinedAt: Date.now(),
     };
     this.state.players.push(player);
@@ -267,6 +324,10 @@ export class Game {
     return this.state.players.find((p) => p.id === id);
   }
 
+  private avatarTaken(avatar: string, exceptId: string): boolean {
+    return this.state.players.some((p) => p.id !== exceptId && p.avatar === avatar);
+  }
+
   // ---------------------------------------------------------------- actions
 
   handle(playerId: string, action: Action): unknown {
@@ -287,14 +348,41 @@ export class Game {
         s.phase = 'submit';
         break;
 
-      case 'rename': {
+      case 'setProfile': {
         const name = cleanText(action.name, 20);
         if (!name) throw new GameError('Bir isim yaz');
         if (s.players.some((p) => p.id !== me.id && p.name.toLocaleLowerCase('tr') === name.toLocaleLowerCase('tr')))
           throw new GameError('Bu isim alınmış');
+        if (!AVATARS.includes(action.avatar)) throw new GameError('Bilinmeyen avatar');
+        if (this.avatarTaken(action.avatar, me.id)) throw new GameError('Bu avatarı başka biri aldı');
         me.name = name;
+        me.avatar = action.avatar;
         break;
       }
+
+      case 'setPlaylist': {
+        host();
+        const raw = String(action.url ?? '').trim();
+        if (!raw) {
+          delete s.playlist;
+          break;
+        }
+        const listId = parsePlaylistId(raw);
+        if (!listId) throw new GameError('Bu bir YouTube oynatma listesi linki gibi görünmüyor (içinde list= olmalı)');
+        const old = s.playlist?.listId === listId ? s.playlist : undefined;
+        s.playlist = {
+          url: playlistUrl(listId),
+          listId,
+          title: old?.title,
+          status: old?.items.length ? 'ready' : 'loading',
+          items: old?.items ?? [],
+          taskId: randomUUID(),
+        };
+        break;
+      }
+
+      case 'suggest':
+        return this.suggest(Array.isArray(action.exclude) ? action.exclude.map(String) : []);
 
       case 'removePlayer': {
         host();
@@ -659,6 +747,7 @@ export class Game {
     const winner = shuffle(leaders)[0];
     r.voteTally = tally;
     r.submission = winner;
+    s.played = [...(s.played ?? []).filter((id) => id !== winner.youtubeId), winner.youtubeId].slice(-300);
     s.submissions = s.submissions.filter((x) => x.id !== winner.id);
     const owner = this.player(winner.playerId);
     if (owner) owner.score += SELECTION_BONUS;
@@ -728,10 +817,16 @@ export class Game {
     return { language: raw.language ?? '', duration: Number(raw.duration) || 0, characters, lines };
   }
 
-  nextJob(name: string, fast: boolean): WorkerJob | null {
+  nextJob(name: string, fast: boolean, canPlaylist = false): WorkerJob | PlaylistTask | null {
     const now = Date.now();
     this.workers.set(name, { lastSeen: now, fast });
     const s = this.state;
+    const pl = s.playlist;
+    // listing a playlist takes a second or two, so whichever worker asks first does it
+    if (canPlaylist && pl?.taskId && (!pl.claimedAt || now - pl.claimedAt > PLAYLIST_TASK_MS)) {
+      pl.claimedAt = now;
+      return { kind: 'playlist', id: pl.taskId, url: pl.url };
+    }
     if (!fast) {
       const fastOnline = [...this.workers.entries()].some(([n, w]) => n !== name && w.fast && now - w.lastSeen < WORKER_ONLINE_MS);
       if (fastOnline) return null; // leave the job for the faster machine
@@ -751,7 +846,62 @@ export class Game {
     }
     this.changed();
     const { id, youtubeId, url, start, end, lang, speakers } = job;
-    return { id, youtubeId, url, start, end, lang, speakers };
+    return { kind: 'clip', id, youtubeId, url, start, end, lang, speakers };
+  }
+
+  /** A worker's answer to a playlist task: the videos, or why the list could not be read. */
+  playlistResult(taskId: string, body: { title?: unknown; items?: unknown; error?: unknown }): void {
+    const pl = this.state.playlist;
+    if (!pl || pl.taskId !== taskId) return; // the host changed the list meanwhile
+    delete pl.taskId;
+    delete pl.claimedAt;
+    if (body.error !== undefined && body.error !== null) {
+      pl.status = pl.items.length ? 'ready' : 'error';
+      pl.error = cleanText(body.error, 300) || 'Liste okunamadı';
+    } else {
+      const seen = new Set<string>();
+      const items: Suggestion[] = [];
+      for (const raw of Array.isArray(body.items) ? (body.items as Record<string, unknown>[]) : []) {
+        const id = parseYouTubeId(String(raw?.youtubeId ?? ''));
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        const d = Number(raw.duration);
+        items.push({
+          youtubeId: id,
+          title: cleanText(raw.title, 120) || 'YouTube videosu',
+          duration: Number.isFinite(d) && d > 0 ? Math.round(d * 10) / 10 : null,
+        });
+      }
+      pl.items = items.slice(0, 1000);
+      pl.title = cleanText(body.title, 120) || undefined;
+      pl.readAt = Date.now();
+      pl.status = items.length ? 'ready' : 'error';
+      if (items.length) delete pl.error;
+      else pl.error = 'Listede oynatılabilir video bulunamadı';
+    }
+    this.changed();
+  }
+
+  /**
+   * Two random videos from the playlist: preferably not in the pool, not played yet and not shown
+   * to this player before. When those run out, it falls back step by step.
+   */
+  private suggest(exclude: string[]): SuggestResult {
+    const pl = this.state.playlist;
+    if (!pl?.items.length) throw new GameError('Öneri listesi hazır değil');
+    const pooled = new Set(this.state.submissions.map((x) => x.youtubeId));
+    const played = new Set(this.state.played ?? []);
+    const shown = new Set(exclude.slice(-200));
+    const lastShown = new Set(exclude.slice(-2));
+    const tiers = [
+      pl.items.filter((x) => !pooled.has(x.youtubeId) && !played.has(x.youtubeId) && !shown.has(x.youtubeId)),
+      pl.items.filter((x) => !pooled.has(x.youtubeId) && !played.has(x.youtubeId) && !lastShown.has(x.youtubeId)),
+      pl.items.filter((x) => !pooled.has(x.youtubeId) && !lastShown.has(x.youtubeId)),
+      pl.items.filter((x) => !lastShown.has(x.youtubeId)),
+      pl.items,
+    ];
+    const tier = tiers.find((t) => t.length >= 2) ?? pl.items;
+    return { items: shuffle(tier).slice(0, 2) };
   }
 
   /** Looks up a job; any call about it also proves its worker is still alive. */
@@ -1014,6 +1164,7 @@ export class Game {
       score: p.score,
       connected: this.isConnected(p.id),
       color: p.color,
+      avatar: p.avatar,
     });
     const sv = (x: Submission): SubmissionView => ({
       id: x.id,
@@ -1035,6 +1186,15 @@ export class Game {
       workerOnline: this.workerOnline(),
       passwordRequired: !!config.gamePassword,
       maxClipSeconds: config.maxClipSeconds,
+      playlist: s.playlist
+        ? {
+            url: s.playlist.url,
+            title: s.playlist.title,
+            status: s.playlist.status,
+            error: s.playlist.error,
+            count: s.playlist.items.length,
+          }
+        : null,
     };
   }
 

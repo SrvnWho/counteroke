@@ -82,21 +82,42 @@ def device() -> str:
 
 # ----------------------------------------------------------------------------- download
 
-def download(job: dict, work: Path) -> Path:
-    args = [
-        sys.executable, "-m", "yt_dlp",
-        "--no-playlist", "--no-progress", "--no-warnings",
-        "-f", "bv*[height<=480][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480]/b",
-        "--merge-output-format", "mp4",
-        "--download-sections", f"*{float(job['start']):.2f}-{float(job['end']):.2f}",
-        "--force-keyframes-at-cuts",
-        "-o", str(work / "source.%(ext)s"),
-    ]
+def _ytdlp(*extra: str) -> list[str]:
+    args = [sys.executable, "-m", "yt_dlp", "--no-progress", "--no-warnings", *extra]
     # yt-dlp needs a JavaScript runtime for YouTube; deno is used automatically, node must be enabled.
     if not shutil.which("deno") and shutil.which("node"):
         args += ["--js-runtimes", "node"]
     if os.path.sep in FFMPEG:
         args += ["--ffmpeg-location", str(Path(FFMPEG).parent)]
+    return args
+
+
+UNPLAYABLE_TITLES = {"[Private video]", "[Deleted video]", "[Unavailable video]"}
+
+
+def list_playlist(url: str, limit: int = 500) -> dict:
+    """Lists a playlist's videos without downloading anything: {title, items: [{youtubeId, title, duration}]}."""
+    out = _run("playlist", _ytdlp("--flat-playlist", "--dump-single-json", "--playlist-end", str(limit), url))
+    data = json.loads(out)
+    items = []
+    for e in data.get("entries") or []:
+        if not e or not e.get("id") or e.get("title") in UNPLAYABLE_TITLES:
+            continue
+        if e.get("availability") in ("private", "needs_auth", "subscriber_only", "premium_only"):
+            continue
+        items.append({"youtubeId": e["id"], "title": e.get("title") or "", "duration": e.get("duration")})
+    return {"title": data.get("title") or "", "items": items}
+
+
+def download(job: dict, work: Path) -> Path:
+    args = _ytdlp(
+        "--no-playlist",
+        "-f", "bv*[height<=480][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480]/b",
+        "--merge-output-format", "mp4",
+        "--download-sections", f"*{float(job['start']):.2f}-{float(job['end']):.2f}",
+        "--force-keyframes-at-cuts",
+        "-o", str(work / "source.%(ext)s"),
+    )
     args.append(job["url"])
     _run("download", args)
     found = sorted(p for p in work.glob("source.*") if p.suffix not in (".part", ".ytdl"))

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { MAX_SPEAKERS } from '../../../shared/constants.ts';
-import type { GameView, Lang, SubmissionView } from '../../../shared/types.ts';
-import { parseYouTubeId } from '../../../shared/youtube.ts';
+import type { GameView, Lang, SubmissionView, Suggestion } from '../../../shared/types.ts';
+import { parseYouTubeId, watchUrl } from '../../../shared/youtube.ts';
 import { act, send, toast } from '../net.ts';
+import { Suggestions } from '../Suggestions.tsx';
 import { fmtTime, playerName, thumb } from '../util.ts';
 import { loadYouTubeApi } from '../youtube.ts';
 import type { YTPlayer } from '../youtube.ts';
@@ -71,6 +72,13 @@ export function Submit({ g }: { g: GameView }) {
 
   useEffect(() => () => window.clearInterval(stopTimer.current), []);
 
+  const pick = (sug: Suggestion) => {
+    setUrl(watchUrl(sug.youtubeId));
+    setStart(0);
+    setEnd(Math.min(sug.duration ?? 30, g.maxClipSeconds));
+    if (/[çğıöşüÇĞİÖŞÜ]/.test(sug.title)) setLang('tr');
+  };
+
   const now = () => Math.round((player?.getCurrentTime() ?? 0) * 10) / 10;
   const previewRange = () => {
     if (!player) return;
@@ -103,6 +111,7 @@ export function Submit({ g }: { g: GameView }) {
     <div className="grid-2">
       <section className="card">
         <h2 className="tape">{mine ? 'Videonu değiştir' : 'Bir video öner'}</h2>
+        <Suggestions g={g} selectedId={videoId} onPick={pick} />
         <label>
           YouTube linki
           <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://www.youtube.com/watch?v=..." />
