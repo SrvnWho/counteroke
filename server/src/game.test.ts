@@ -4,12 +4,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { AVATARS } from '../../shared/constants.ts';
-import type { PlaylistTask, SuggestResult } from '../../shared/types.ts';
+import type { PlaylistTask, SuggestResult, WorkerJob } from '../../shared/types.ts';
 import { parsePlaylistId } from '../../shared/youtube.ts';
 
 // The game keeps its state under DATA_DIR, so point it at a throwaway folder before loading it.
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'counteroke-game-'));
-const { Game } = await import('./game.ts');
+const { Game, JobGone } = await import('./game.ts');
 
 function newGame() {
   const game = new Game(() => {});
@@ -97,4 +97,156 @@ test('a failed playlist read is reported, and a stale answer is ignored', () => 
   assert.throws(() => game.handle(host, { type: 'suggest' }), /hazır değil/);
   game.handle(host, { type: 'setPlaylist', url: '' });
   assert.equal(game.view(host).playlist, null);
+});
+
+// ------------------------------------------------------------------ rounds (no network, no ffmpeg)
+
+// submitVideo looks the title up on YouTube in the background; keep tests offline.
+globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+const SCRIPT = {
+  language: 'en',
+  duration: 10,
+  characters: [
+    { id: 0, name: 'A' },
+    { id: 1, name: 'B' },
+  ],
+  lines: [
+    { id: 'x', start: 1, end: 3, speaker: 0, text: 'hello there' },
+    { id: 'y', start: 4, end: 6, speaker: 1, text: 'hi' },
+  ],
+};
+
+/** Plays a round up to the script screen with one 2-character video. */
+function toScript(game: InstanceType<typeof Game>, host: string, videoId: string) {
+  game.handle(host, { type: 'startGame' });
+  game.handle(host, { type: 'submitVideo', url: `https://youtu.be/${videoId}`, start: 0, end: 10, speakers: 2, lang: 'en' });
+  game.handle(host, { type: 'openVoting' }); // a single video wins right away
+  const job = game.nextJob('pc', true) as WorkerJob;
+  fs.writeFileSync(game.jobUploadPath(job.id), 'video');
+  game.jobDone(job.id, SCRIPT);
+  assert.equal(game.view(host).phase, 'script');
+}
+
+test('script lines can be added, re-timed and brought back after deleting', () => {
+  const { game, join } = newGame();
+  const host = join('Host');
+  toScript(game, host, 'scriptvid01');
+  const added = game.handle(host, { type: 'addLine', start: 3.5, end: 3.9, speaker: 1, text: ' yeni ' }) as { lineId: string };
+  let lines = game.view(host).round!.script!.lines;
+  assert.deepEqual(lines.map((l) => l.text), ['hello there', 'yeni', 'hi'], 'kept in time order');
+  game.handle(host, { type: 'updateLine', lineId: added.lineId, start: 7, end: 8 });
+  lines = game.view(host).round!.script!.lines;
+  assert.equal(lines.at(-1)!.id, added.lineId, 'moved after re-timing');
+  assert.throws(() => game.handle(host, { type: 'updateLine', lineId: added.lineId, end: 7.1 }), /0.2 sn/);
+
+  const first = lines[0];
+  game.handle(host, { type: 'deleteLine', lineId: first.id });
+  game.handle(host, {
+    type: 'addLine',
+    start: first.start,
+    end: first.end,
+    speaker: first.speaker,
+    text: first.text,
+    words: [{ w: 'hello', s: 1, e: 1.5 }],
+  });
+  const back = game.view(host).round!.script!.lines[0];
+  assert.equal(back.text, 'hello there');
+  assert.deepEqual(back.words, [{ w: 'hello', s: 1, e: 1.5 }]);
+});
+
+test('latecomers are seated in a short group, or get their own', () => {
+  const { game, join } = newGame();
+  const host = join('Host');
+  join('Ali');
+  join('Ayşe');
+  toScript(game, host, 'latevideo01');
+  game.handle(host, { type: 'openCasting' });
+  const sizes = () => game.view(host).round!.groups.map((g) => g.members.length).sort();
+  assert.deepEqual(sizes(), [1, 2]);
+
+  const cem = join('Cem'); // joins during casting: fills the short group
+  assert.deepEqual(sizes(), [2, 2]);
+  const cemGroup = game.view(host).round!.groups.find((g) => g.members.includes(cem))!;
+  assert.equal(new Set(Object.values(cemGroup.roles)).size, 2, 'roles dealt again: one character each');
+
+  game.handle(host, { type: 'openRecording' });
+  const deniz = join('Deniz'); // every group is full: a group of their own, voicing both characters
+  const own = game.view(host).round!.groups.find((g) => g.members.includes(deniz))!;
+  assert.deepEqual(own.members, [deniz]);
+  assert.deepEqual(Object.values(own.roles), [deniz, deniz]);
+  join('Ece'); // the solo group hasn't recorded anything yet: Ece joins it
+  assert.deepEqual(sizes(), [2, 2, 2]);
+
+  // nobody recorded: groups are not screened as plain music
+  game.handle(host, { type: 'finishRecording' });
+  const groups = game.view(host).round!.groups;
+  assert.ok(groups.every((g) => g.mixStatus === 'error' && /kayıt göndermedi/.test(g.mixError ?? '')));
+  assert.equal(game.view(host).phase, 'mixing');
+});
+
+function submissionOf(game: InstanceType<typeof Game>, viewer: string, owner: string): string {
+  return game.view(viewer).submissions.find((s) => s.playerId === owner)!.id;
+}
+
+test('the vote leader is processed ahead of time and the winner keeps that work', () => {
+  const { game, join } = newGame();
+  const host = join('Host');
+  const ali = join('Ali');
+  const ayse = join('Ayşe');
+  game.handle(host, { type: 'startGame' });
+  game.handle(ali, { type: 'submitVideo', url: 'https://youtu.be/prefetchA01', start: 0, end: 10, speakers: 1, lang: 'tr' });
+  game.handle(ayse, { type: 'submitVideo', url: 'https://youtu.be/prefetchB01', start: 0, end: 10, speakers: 1, lang: 'tr' });
+  assert.equal(game.nextJob('phone', false), null, 'no fast worker: the pool is not processed in advance');
+  game.handle(host, { type: 'openVoting' });
+  assert.equal(game.nextJob('phone', false), null, 'no votes yet: no leader');
+
+  game.handle(host, { type: 'vote', submissionId: submissionOf(game, host, ali) });
+  const early = game.nextJob('phone', false) as WorkerJob;
+  assert.equal(early.youtubeId, 'prefetchA01', 'the leader is handed to the phone');
+  game.jobProgress(early.id, 'separate', 0.3);
+
+  game.handle(ayse, { type: 'vote', submissionId: submissionOf(game, host, ali) });
+  game.handle(ali, { type: 'vote', submissionId: submissionOf(game, host, ayse) });
+  const v = game.view(host);
+  assert.equal(v.phase, 'processing');
+  assert.equal(v.round!.submission!.youtubeId, 'prefetchA01');
+  assert.equal(v.round!.clip!.status, 'processing', 'picks up the job that is already running');
+  assert.equal(v.round!.clip!.stage, 'separate');
+  assert.equal(v.round!.clip!.progress, 0.3);
+});
+
+test('work on a video that lost the vote is called off', () => {
+  const { game, join } = newGame();
+  const host = join('Host');
+  const ali = join('Ali');
+  const ayse = join('Ayşe');
+  game.handle(host, { type: 'startGame' });
+  game.handle(ali, { type: 'submitVideo', url: 'https://youtu.be/lostvideo01', start: 0, end: 10, speakers: 1, lang: 'tr' });
+  game.handle(ayse, { type: 'submitVideo', url: 'https://youtu.be/wonvideo001', start: 0, end: 10, speakers: 1, lang: 'tr' });
+  game.handle(host, { type: 'openVoting' });
+  game.handle(host, { type: 'vote', submissionId: submissionOf(game, host, ali) });
+  const early = game.nextJob('phone', false) as WorkerJob;
+  assert.equal(early.youtubeId, 'lostvideo01');
+  game.handle(ali, { type: 'vote', submissionId: submissionOf(game, host, ayse) });
+  game.handle(host, { type: 'vote', submissionId: submissionOf(game, host, ayse) }); // changes their vote
+  game.handle(ayse, { type: 'vote', submissionId: submissionOf(game, host, ali) });
+  assert.equal(game.view(host).round!.submission!.youtubeId, 'wonvideo001');
+  assert.throws(() => game.jobProgress(early.id, 'transcribe', 0.6), JobGone, 'the worker is told to stop');
+  const next = game.nextJob('phone', false) as WorkerJob;
+  assert.equal(next.youtubeId, 'wonvideo001');
+});
+
+test('with a fast worker online the whole pool is processed', () => {
+  const { game, join } = newGame();
+  const host = join('Host');
+  const ali = join('Ali');
+  game.handle(host, { type: 'startGame' });
+  game.nextJob('pc', true); // the PC says hello
+  game.handle(ali, { type: 'submitVideo', url: 'https://youtu.be/poolvideo01', start: 0, end: 10, speakers: 1, lang: 'tr' });
+  game.handle(host, { type: 'submitVideo', url: 'https://youtu.be/poolvideo02', start: 0, end: 10, speakers: 1, lang: 'tr' });
+  assert.equal(game.nextJob('phone', false), null, 'pool work is left to the fast worker');
+  const a = game.nextJob('pc', true) as WorkerJob;
+  const b = game.nextJob('pc', true) as WorkerJob;
+  assert.deepEqual([a.youtubeId, b.youtubeId].sort(), ['poolvideo01', 'poolvideo02']);
 });

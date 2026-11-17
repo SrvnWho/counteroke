@@ -106,6 +106,8 @@ export interface GroupView {
   mixError?: string;
   /** only visible to the group's own members, or once the group has been screened */
   mixUrl?: string;
+  /** the mix's sound alone: the gala plays it over the (already cached) clip; also given for the next group so it can preload */
+  mixAudioUrl?: string;
   /** server time (ms) at which a synced group take starts */
   takeStartAt?: number;
   /** line-by-line: index (into script.lines) of the line the group is on */
@@ -135,7 +137,12 @@ export interface RoundView {
   groups: GroupView[];
   screeningOrder: string[];
   screeningIndex: number;
+  /** unset while the gala waits for everyone's player to load (at most a few seconds) */
   screeningStartAt?: number;
+  /** changes every time a group's screening is (re)started; players report "loaded" for it */
+  screenSeq: number;
+  /** players whose player has loaded for the current screenSeq */
+  screenReadyCount: number;
   /** groupId -> playerIds that rated it */
   ratedBy: Record<string, string[]>;
   myRatings: Record<string, number>;
@@ -155,6 +162,8 @@ export interface GameView {
   maxClipSeconds: number;
   /** playlist the "no idea?" suggestions come from, set by the host */
   playlist: PlaylistView | null;
+  /** fixed address friends use to join (PUBLIC_URL), when set */
+  publicUrl: string | null;
 }
 
 /** Everything a client can ask the server to do, sent over the `action` socket event. */
@@ -173,7 +182,9 @@ export type Action =
   | { type: 'closeVoting' }
   | { type: 'retryProcessing' }
   | { type: 'backToVoting' }
-  | { type: 'updateLine'; lineId: string; text?: string; speaker?: number }
+  | { type: 'updateLine'; lineId: string; text?: string; speaker?: number; start?: number; end?: number }
+  /** answers with { lineId } */
+  | { type: 'addLine'; start: number; end: number; speaker: number; text: string; words?: Word[] }
   | { type: 'deleteLine'; lineId: string }
   | { type: 'renameCharacter'; characterId: number; name: string }
   | { type: 'setCharacterCount'; count: number }
@@ -189,6 +200,7 @@ export type Action =
   | { type: 'lineCancel' }
   | { type: 'finishRecording' }
   | { type: 'rate'; groupId: string; stars: number }
+  | { type: 'screenReady'; seq: number }
   | { type: 'replayScreening' }
   | { type: 'nextScreening' }
   | { type: 'showResults' }

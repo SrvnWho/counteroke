@@ -15,6 +15,7 @@ import platform
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -50,6 +51,13 @@ def friendly(e: Exception) -> str:
     return f"{prefix}: {text[-400:]}"
 
 
+class Cancelled(Exception):
+    """The server dropped the job (e.g. a different video won the vote)."""
+
+
+GONE = 410  # the server's answer for a job it no longer wants
+
+
 def handle(session: requests.Session, server: str, job: dict) -> None:
     base = f"{server}/api/worker/jobs/{job['id']}"
     last = {"stage": None, "t": 0.0}
@@ -60,9 +68,11 @@ def handle(session: requests.Session, server: str, job: dict) -> None:
             return
         last.update(stage=stage, t=now)
         try:
-            session.post(f"{base}/progress", json={"stage": stage, "progress": value}, timeout=10)
+            r = session.post(f"{base}/progress", json={"stage": stage, "progress": value}, timeout=10)
         except requests.RequestException:
-            pass
+            return
+        if r.status_code == GONE:
+            raise Cancelled()
 
     print(f"[worker] iş alındı: {job['url']} {job['start']}-{job['end']} sn, {job['speakers']} kişi, {job['lang']}")
     work = Path(tempfile.mkdtemp(prefix=f"counteroke-{job['id'][:8]}-"))
@@ -71,10 +81,16 @@ def handle(session: requests.Session, server: str, job: dict) -> None:
         progress("upload", 0.97)
         with open(clip, "rb") as f:
             r = session.put(f"{base}/clip", data=f, headers={"content-type": "video/mp4"}, timeout=900)
+        if r.status_code == GONE:
+            raise Cancelled()
         r.raise_for_status()
         r = session.post(f"{base}/done", json={"script": script}, timeout=60)
+        if r.status_code == GONE:
+            raise Cancelled()
         r.raise_for_status()
         print(f"[worker] bitti: {len(script['lines'])} replik, süreler {timings}")
+    except Cancelled:
+        print("[worker] iş iptal edildi (başka video seçildi)")
     except Exception as e:
         traceback.print_exc()
         try:
@@ -99,6 +115,13 @@ def handle_playlist(session: requests.Session, server: str, task: dict) -> None:
         print(f"[worker] liste sunucuya gönderilemedi: {e}")
 
 
+def _warmup() -> None:
+    try:
+        pipeline.warmup()
+    except Exception as e:  # the first job will try again and report a proper error
+        print(f"[worker] modeller önceden yüklenemedi: {e}")
+
+
 def clean_temp(max_age_hours: float = 6) -> None:
     """Removes working folders left behind by jobs that were cut off (crash, closed window)."""
     cutoff = time.time() - max_age_hours * 3600
@@ -121,11 +144,14 @@ def serve(args: argparse.Namespace) -> None:
     session = requests.Session()
     session.headers["x-worker-token"] = args.token
     print(f"[worker] '{args.name}' {server} adresine bağlanıyor (cihaz: {pipeline.device()}, hızlı: {fast})")
+    threading.Thread(target=_warmup, daemon=True).start()
     warned = False
     while True:
+        asked = time.time()
         try:
-            params = {"name": args.name, "fast": "1" if fast else "0", "caps": "playlist"}
-            r = session.get(f"{server}/api/worker/next", params=params, timeout=20)
+            # the server holds the request until there is work (up to `wait` seconds)
+            params = {"name": args.name, "fast": "1" if fast else "0", "caps": "playlist", "wait": "25"}
+            r = session.get(f"{server}/api/worker/next", params=params, timeout=45)
         except requests.RequestException as e:
             if not warned:
                 print(f"[worker] sunucuya ulaşılamıyor, tekrar denenecek: {e}")
@@ -136,7 +162,8 @@ def serve(args: argparse.Namespace) -> None:
             print("[worker] sunucuya bağlandı")
             warned = False
         if r.status_code == 204:
-            time.sleep(args.poll)
+            if time.time() - asked < 1:  # server answered at once (no long polling): don't hammer it
+                time.sleep(args.poll)
             continue
         if r.status_code == 401:
             sys.exit("[worker] WORKER_TOKEN sunucudakiyle aynı değil")

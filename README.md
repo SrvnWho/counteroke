@@ -5,14 +5,18 @@ Arkadaşlarla tarayıcıda oynanan bir seslendirme (dublaj) parti oyunu.
 1. Herkes bir YouTube linki önerir, başlangıç/bitiş saniyesini, kaç kişinin konuştuğunu ve dili seçer.
    Aklına video gelmeyen, oda sahibinin Kulis'te verdiği oynatma listesinden gelen iki videodan birini
    seçebilir ya da "Başka iki tane" ile yenilerini getirebilir (listeyi worker yt-dlp ile okur).
-2. Oylamayla bir video seçilir (kendi videona oy veremezsin, videosu seçilen +1 puan alır).
+2. Oylamayla bir video seçilir (kendi videona oy veremezsin, videosu seçilen +1 puan alır). Oylama sürerken
+   önde olan video (bilgisayar worker'ı bağlıysa havuzdaki hepsi) önceden işlenmeye başlar.
 3. Sunucu videodaki **konuşmaları siler, müzik ve efektleri bırakır**, konuşmaları yazıya çevirir ve
-   karakterlere böler. Senaryo ekranında herkes metni ve konuşmacıları düzeltebilir.
+   karakterlere böler. Senaryo ekranında herkes metni, konuşmacıları ve zamanları düzeltebilir, eksik repliği
+   ekleyebilir, orijinal sesi YouTube'dan dinleyebilir.
 4. Oyuncular karakter sayısı kadar kişilik gruplara bölünür (9 kişi, 4 karakter → 4 + 4 + 1). Eksik grupta
    bir oyuncu birden fazla karakteri seslendirir; her karakterine ayrı ses efekti otomatik uygulanır.
-5. Gruplar kendi evinden, ekrandaki karaoke senaryosuna bakarak kaydeder. "Grupça başlat" ile gruptaki herkesin
-   kaydı aynı anda başlar.
-6. Her grubun videosu herkese aynı anda gösterilir, 1-5 yıldız verilir (kendi grubuna da). En yüksek
+5. Gruplar kendi evinden, ekrandaki karaoke senaryosuna bakarak kaydeder: replik replik (sırası gelene ses ve
+   titreşimle haber verilir) ya da "Grupça başlat" ile tek seferde. Kayıtlar tarayıcıda saklanır, sayfa
+   yenilense de kaybolmaz. Oyuna sonradan katılan eksik bir gruba ya da kendi grubuna eklenir.
+6. Her grubun videosu herkese aynı anda gösterilir (herkesin oynatıcısı yüklenince başlar, geride kalan
+   yakalar), 1-5 yıldız verilir (kendi grubuna da). En yüksek
    ortalama kazanır, herkes grubunun ortalamasını puan olarak alır. Sonra sıradaki video oylanır.
 
 ## Parçalar
@@ -89,6 +93,7 @@ Bkz. [docs/telefon-kurulum.md](docs/telefon-kurulum.md).
 | `PORT` | `3100` | Sunucu portu |
 | `WORKER_TOKEN` | `counteroke-dev` | Worker ile sunucu arasındaki ortak anahtar. İnternete açarken mutlaka değiştir. |
 | `GAME_PASSWORD` | boş | Doluysa oyuna girmek için şifre ister |
+| `PUBLIC_URL` | boş | Arkadaşların açtığı sabit adres; Kulis'te gösterilir |
 | `MAX_CLIP_SECONDS` | `120` | Önerilebilecek en uzun klip |
 | `KEEP_DAYS` | `7` | Bu kadar gün kullanılmayan klipler ve sahne videoları silinir. `0` = hiç silme |
 | `DATA_DIR` | `data/` | Videolar, kayıtlar ve oyun durumu |
@@ -96,6 +101,8 @@ Bkz. [docs/telefon-kurulum.md](docs/telefon-kurulum.md).
 | `WHISPER_MODEL` | GPU: `large-v3-turbo`, CPU: `small` | Yazıya çevirme modeli |
 | `DEMUCS_MODEL` | `htdemucs` | Konuşma ayırma modeli |
 | `WORKER_THREADS` | hepsi | Worker'ın kullanacağı çekirdek sayısı |
+| `WHISPER_BEAM` | GPU: `5`, CPU: `1` | Yazıya çevirmede denenen tahmin sayısı (büyük = yavaş ama biraz daha doğru) |
+| `DEMUCS_OVERLAP` | GPU: `0.25`, CPU: `0.1` | Ses ayırmada parçaların üst üste binme oranı |
 
 ## Depolama
 

@@ -1,5 +1,3 @@
-import { useEffect, useState } from 'react';
-
 let ctx: AudioContext | null = null;
 
 export function audioCtx(): AudioContext {
@@ -180,32 +178,4 @@ export function playPreview(
     .catch(stop);
   video.addEventListener('ended', stop);
   return stop;
-}
-
-/** 0..1 loudness of the mic, for a level meter. */
-export function useMicLevel(stream: MediaStream | null): number {
-  const [level, setLevel] = useState(0);
-  useEffect(() => {
-    if (!stream) return;
-    const c = audioCtx();
-    const source = c.createMediaStreamSource(stream);
-    const analyser = c.createAnalyser();
-    analyser.fftSize = 1024;
-    source.connect(analyser);
-    const data = new Float32Array(analyser.fftSize);
-    let raf = 0;
-    const tick = () => {
-      analyser.getFloatTimeDomainData(data);
-      let sum = 0;
-      for (const v of data) sum += v * v;
-      setLevel(Math.min(1, Math.sqrt(sum / data.length) * 4));
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => {
-      cancelAnimationFrame(raf);
-      source.disconnect();
-    };
-  }, [stream]);
-  return level;
 }

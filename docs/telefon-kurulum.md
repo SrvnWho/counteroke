@@ -9,7 +9,7 @@ Kurulumdan sonra telefonda üç şey çalışır, üçü de pm2 altında ve anuc
 |---|---|---|
 | `counteroke-server` | Oyun sunucusu ve arayüz (port 3100) | Termux, Node.js |
 | `counteroke-worker` | Ses ayırma, yazıya çevirme, konuşmacı ayırma | Termux içindeki Ubuntu kutusu |
-| `counteroke-tunnel` | Arkadaşlarına `https://…trycloudflare.com` linki verir | Termux, cloudflared |
+| `counteroke-tunnel` | Sabit adresi (ör. `https://counteroke.alanadin.com`) telefona bağlar | Termux, cloudflared |
 
 ## 1. Termux paketleri
 
@@ -72,9 +72,13 @@ PATH=/root/.deno/bin:$PATH WORKER_THREADS=4 .venv-phone/bin/python worker.py tes
 İlk çalıştırmada modeller iner (yaklaşık 600 MB), ikinci çalıştırma gerçek hızı gösterir. Sonuçları bana
 yazarsan model ayarlarını telefona göre ayarlarız. Çıkmak için `exit`.
 
-## 4. Anahtarı ayarla
+Telefonda (ekran kartı olmayan her makinede) worker zaten hafif ayarlarla çalışır: yazıya çevirme tek tahminle
+(`WHISPER_BEAM=1`), ses ayırma daha az üst üste binen parçalarla (`DEMUCS_OVERLAP=0.1`). Kalite yetmezse bu iki
+değeri `counteroke.config.cjs` içindeki worker satırına ekleyip büyütebilirsin (5 ve 0.25 bilgisayardaki değerler).
 
-Gizli ayarlar `counteroke.secrets.json` dosyasında duruyor. Bu dosya git'e hiç girmez, yani GitHub'a
+## 4. Ayarları yaz
+
+Ayarlar `counteroke.secrets.json` dosyasında duruyor. Bu dosya git'e hiç girmez, yani anahtarlar GitHub'a
 yanlışlıkla gitmez. Örnek dosyadan kopyala:
 
 ```bash
@@ -87,10 +91,32 @@ Uzun, rastgele bir anahtar üret:
 head -c 24 /dev/urandom | base64
 ```
 
-Çıkan yazıyı `counteroke.secrets.json` içindeki `WORKER_TOKEN` değerine yapıştır (`nano counteroke.secrets.json`).
-İstersen `GAME_PASSWORD` ile oyuna şifre de koyabilirsin; boş bırakırsan şifre sorulmaz.
+Dosyayı `nano counteroke.secrets.json` ile aç ve doldur:
 
-## 5. Oyun gecesi
+| Ayar | Ne yazılır |
+|---|---|
+| `WORKER_TOKEN` | Az önce ürettiğin yazı |
+| `GAME_PASSWORD` | İstersen oda şifresi; boş bırakırsan şifre sorulmaz |
+| `PUBLIC_URL` | Arkadaşlarının açacağı sabit adres, ör. `https://counteroke.alanadin.com` |
+| `TUNNEL_TOKEN` | Bir sonraki adımda Cloudflare'den alacağın tünel anahtarı |
+
+## 5. Sabit adres (Cloudflare tüneli)
+
+Oyun her açılışta aynı adreste olur, link değişmez. Bunun için alan adının DNS'i Cloudflare'de olmalı (alan
+adının "nameserver"ları Cloudflare'i gösteriyorsa tamam).
+
+1. Cloudflare panelinde **Zero Trust → Networks → Tunnels → Create a tunnel** yolunu izle, türü **Cloudflared**
+   seç, adına `counteroke` yaz.
+2. Kurulum ekranında gösterilen komutun sonundaki uzun anahtarı (`eyJ…` ile başlar) kopyala ve
+   `counteroke.secrets.json` içindeki `TUNNEL_TOKEN` değerine yapıştır. Komutu çalıştırmana gerek yok, tüneli pm2
+   başlatacak.
+3. Sonraki adımda bir adres ekle (panelde "Public hostname" ya da "Published application routes" diye geçer):
+   alt alan adı `counteroke`, alan adı seninki, servis türü **HTTP**, adres **`localhost:3100`**. Kaydet.
+
+Telefonda başka bir tünel zaten çalışıyorsa (ör. anucvc için) yeni tünel açmak yerine o tünele de aynı adresi
+ekleyebilirsin. O zaman `TUNNEL_TOKEN`'ı boş bırak; pm2 ayrı bir tünel başlatmaz.
+
+## 6. Oyun gecesi
 
 Başlat:
 
@@ -98,13 +124,9 @@ Başlat:
 cd ~/counteroke && pm2 start counteroke.config.cjs
 ```
 
-Linki bul (bir iki saniye sürebilir):
-
-```bash
-pm2 logs counteroke-tunnel --lines 40 --nostream
-```
-
-`https://…trycloudflare.com` ile biten linki arkadaşlarına at. Link her açılışta değişir.
+Arkadaşlarına `PUBLIC_URL` adresini at; Kulis ekranında da bu adres görünür. Adres her açılışta aynıdır.
+Oyuna sonradan katılan da oynar: rol dağıtımı ya da kayıt sırasında girerse eksik bir gruba ya da kendi grubuna
+eklenir.
 
 Bitince kapat:
 
@@ -115,23 +137,29 @@ pm2 delete counteroke.config.cjs
 `stop` yerine `delete` kullanıyoruz: böylece `pm2 save` yaptığında counteroke kayda girmez ve telefon yeniden
 başlayınca kendiliğinden açılmaz. anucvc bundan etkilenmez.
 
-## 6. Bilgisayarı hızlı işleyici olarak bağlamak (önerilir)
+## 7. Bilgisayarı hızlı işleyici olarak bağlamak (önerilir)
 
 Telefon bir klibi birkaç dakikada işleyebilir. Bilgisayarındaki RTX 2070 Super aynı işi saniyeler içinde
 yapar. Oyun gecesi bilgisayarında, projenin `worker` klasöründe şunu çalıştırman yeterli (anahtar,
 telefondaki `counteroke.secrets.json` ile aynı olmalı):
 
 ```bash
-.venv\Scripts\python worker.py --server https://<telefondaki-link> --token <WORKER_TOKEN>
+.venv\Scripts\python worker.py --server https://counteroke.alanadin.com --token <WORKER_TOKEN>
 ```
 
-Bilgisayardaki worker bağlıyken telefon işleri ona bırakır. Bilgisayar kapanırsa telefon devam eder.
+Bilgisayardaki worker bağlıyken telefon işleri ona bırakır, havuzdaki videoları da oylama bitmeden önceden işler.
+Böylece hangi video kazanırsa kazansın senaryo çoğu zaman hemen açılır. Bilgisayar kapanırsa telefon devam eder;
+telefon tek başınayken sadece oylamada önde olan videoyu önceden işler.
 
 ## Sorun giderme
 
 - **Worker sürekli yeniden başlıyor:** `pm2 logs counteroke-worker` ile hatayı gör. Ubuntu kutusunun adının
   `ubuntu` olduğundan emin ol (`proot-distro list`).
 - **"YouTube bot kontrolü istedi":** Biraz bekleyip tekrar dene ya da başka video seç.
+- **Adres açılmıyor, Cloudflare "1033" hatası:** Tünel çalışmıyor. `pm2 logs counteroke-tunnel` ile bak;
+  `TUNNEL_TOKEN` yanlış kopyalanmış olabilir.
+- **Adres açılıyor ama "502 Bad Gateway":** Tünel çalışıyor ama oyun sunucusu kapalı ya da panelde adres
+  `localhost:3100` değil. `pm2 logs counteroke-server` ile bak.
 - **Telefon ısınıyor / anucvc takılıyor:** `counteroke.config.cjs` içindeki `WORKER_THREADS=4` değerini 2'ye
   düşür.
 - **Depolama dolar mı:** Sunucu her açılışta 7 günden eski klipleri ve sahne videolarını siler. Süreyi

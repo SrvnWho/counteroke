@@ -21,6 +21,7 @@ import type {
   SubmissionView,
   Suggestion,
   SuggestResult,
+  Word,
   WorkerJob,
 } from '../../shared/types.ts';
 import { config } from './config.ts';
@@ -31,6 +32,9 @@ import { fetchTitle, parsePlaylistId, parseYouTubeId, playlistUrl, watchUrl } fr
 
 /** An error whose message is shown to the player as-is. */
 export class GameError extends Error {}
+
+/** A worker asked about a job the server dropped (another video won); the worker stops it. */
+export class JobGone extends GameError {}
 
 interface Player {
   id: string;
@@ -63,6 +67,13 @@ interface Job extends WorkerJob {
   status: 'queued' | 'claimed';
   claimedBy?: string;
   updatedAt: number;
+  /**
+   * Set for work done ahead of time: 'leader' = the video leading the vote (any worker),
+   * 'pool' = another video in the pool (only fast workers). Unset = needed right now.
+   */
+  prep?: 'leader' | 'pool';
+  stage?: string;
+  progress?: number;
 }
 
 interface Recording {
@@ -113,6 +124,8 @@ interface Round {
   screeningOrder: string[];
   screeningIndex: number;
   screeningStartAt?: number;
+  screenSeq?: number;
+  screenReady?: string[];
   ratings: Record<string, Record<string, number>>;
   results?: GroupResult[];
   winnerGroupIds?: string[];
@@ -148,6 +161,9 @@ const WORKER_ONLINE_MS = 15_000;
 const STALE_JOB_MS = 10 * 60_000;
 const SELECTION_BONUS = 1;
 const PLAYLIST_TASK_MS = 2 * 60_000;
+/** the gala waits at most this long for slow players' videos to load */
+const SCREEN_WAIT_MS = 8000;
+const SCREEN_COUNTDOWN_MS = 3000;
 /** re-read the playlist after this long, so videos added to it show up */
 const PLAYLIST_REFRESH_MS = 24 * 3600_000;
 
@@ -167,6 +183,20 @@ function clampInt(n: unknown, min: number, max: number): number {
 
 function cleanText(s: unknown, max: number): string {
   return String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+/** Word timings sent back by a client (undoing a deleted line); anything odd is dropped. */
+function cleanWords(raw: unknown): Word[] | undefined {
+  if (!Array.isArray(raw) || !raw.length) return undefined;
+  const words = raw
+    .slice(0, 500)
+    .map((x) => ({ w: cleanText((x as Word)?.w, 60), s: Number((x as Word)?.s), e: Number((x as Word)?.e) }))
+    .filter((x) => x.w && Number.isFinite(x.s) && Number.isFinite(x.e));
+  return words.length ? words : undefined;
 }
 
 /** State writes run one at a time, so a slow disk never has two writers on the same temp file. */
@@ -190,6 +220,9 @@ export class Game {
   private workers = new Map<string, { lastSeen: number; fast: boolean }>();
   private hostTimers = new Map<string, NodeJS.Timeout>();
   private mixChain: Promise<void> = Promise.resolve();
+  /** clips whose pre-processing failed: not retried ahead of time (they still run if picked) */
+  private failedPrep = new Set<string>();
+  private screenTimer: NodeJS.Timeout | undefined;
   private saveTimer: NodeJS.Timeout | null = null;
   private readonly onChange: () => void;
 
@@ -223,6 +256,8 @@ export class Game {
       }
     }
     if (s.phase === 'mixing') setTimeout(() => this.requestAllMixes(), 0);
+    // restarted while the gala waited for players: just start it
+    if (s.phase === 'screening' && r && !r.screeningStartAt) r.screeningStartAt = Date.now() + 4000;
     return s;
   }
 
@@ -285,7 +320,9 @@ export class Game {
   }
 
   connect(playerId: string): void {
-    this.sockets.set(playerId, (this.sockets.get(playerId) ?? 0) + 1);
+    const before = this.sockets.get(playerId) ?? 0;
+    this.sockets.set(playerId, before + 1);
+    if (before === 0) this.seatLatecomer(playerId);
     const t = this.hostTimers.get(playerId);
     if (t) {
       clearTimeout(t);
@@ -316,6 +353,42 @@ export class Game {
     this.changed();
   }
 
+  /**
+   * Someone who joins (or comes back) after the groups were made still gets to play: they join a
+   * group that is short of people and has not started recording, or form a new group of their own.
+   */
+  private seatLatecomer(playerId: string): void {
+    const s = this.state;
+    const r = s.round;
+    if (!r?.script || (s.phase !== 'casting' && s.phase !== 'recording')) return;
+    if (r.groups.some((g) => g.members.includes(playerId))) return;
+    const loads = characterLoads(r.script);
+    const untouched = (g: Group) =>
+      !Object.keys(g.recordings).length && !g.linesDone?.length && !g.lineTake && !g.takeStartAt;
+    const open = r.groups
+      .filter((g) => g.members.length < r.script!.characters.length && (s.phase === 'casting' || untouched(g)))
+      .sort((a, b) => a.members.length - b.members.length)[0];
+    if (open) {
+      open.members.push(playerId);
+      open.roles = distributeRoles(open.members, loads);
+      open.effects = defaultEffects(open.roles, loads);
+      open.ready = [];
+      return;
+    }
+    const roles = distributeRoles([playerId], loads);
+    r.groups.push({
+      id: randomUUID(),
+      index: r.groups.length,
+      members: [playerId],
+      roles,
+      effects: defaultEffects(roles, loads),
+      ready: [],
+      recordings: {},
+      mixStatus: 'none',
+      mixVersion: 0,
+    });
+  }
+
   private isConnected(id: string): boolean {
     return (this.sockets.get(id) ?? 0) > 0;
   }
@@ -340,6 +413,7 @@ export class Game {
       if (!allowed.includes(this.state.phase)) throw new GameError('Şu an bunu yapamazsın');
     };
     const s = this.state;
+    let result: unknown;
 
     switch (action.type) {
       case 'startGame':
@@ -407,6 +481,7 @@ export class Game {
       case 'submitVideo':
         phase('submit');
         this.submitVideo(me, action);
+        this.prefetch();
         break;
 
       case 'removeSubmission': {
@@ -415,6 +490,7 @@ export class Game {
         if (!sub) break;
         if (sub.playerId !== me.id && !me.isHost) throw new GameError('Sadece kendi videonu kaldırabilirsin');
         s.submissions = s.submissions.filter((x) => x !== sub);
+        this.prefetch();
         break;
       }
 
@@ -431,6 +507,7 @@ export class Game {
         if (sub.playerId === me.id) throw new GameError('Kendi videona oy veremezsin');
         s.round!.votes[me.id] = sub.id;
         if (this.everyoneVoted()) this.closeVoting();
+        else this.prefetch();
         break;
       }
 
@@ -478,6 +555,37 @@ export class Game {
           }
         }
         if (action.speaker !== undefined) line.speaker = clampInt(action.speaker, 0, script.characters.length - 1);
+        if (action.start !== undefined || action.end !== undefined) {
+          const max = script.duration > 0 ? script.duration : Infinity;
+          const start = Math.max(0, Math.min(max, Number(action.start ?? line.start)));
+          const end = Math.max(0, Math.min(max, Number(action.end ?? line.end)));
+          if (!Number.isFinite(start) || !Number.isFinite(end) || end < start + 0.2)
+            throw new GameError('Bitiş, başlangıçtan en az 0.2 sn sonra olmalı');
+          line.start = round2(start);
+          line.end = round2(end);
+          delete line.words; // the old word timings no longer fit; the prompter spreads the words evenly
+          script.lines.sort((a, b) => a.start - b.start);
+        }
+        break;
+      }
+
+      case 'addLine': {
+        phase('script', 'casting');
+        const script = this.script();
+        const max = script.duration > 0 ? script.duration : Infinity;
+        const start = Math.max(0, Math.min(max - 0.2, Number(action.start) || 0));
+        const end = Math.min(max, Math.max(start + 0.2, Number(action.end) || start + 2));
+        const line: ScriptLine = {
+          id: randomUUID().slice(0, 8),
+          start: round2(start),
+          end: round2(end),
+          speaker: clampInt(action.speaker ?? 0, 0, script.characters.length - 1),
+          text: cleanText(action.text, 300),
+          words: cleanWords(action.words),
+        };
+        script.lines.push(line);
+        script.lines.sort((a, b) => a.start - b.start);
+        result = { lineId: line.id };
         break;
       }
 
@@ -620,10 +728,20 @@ export class Game {
         break;
       }
 
+      case 'screenReady': {
+        phase('screening');
+        const r = s.round!;
+        if (action.seq !== r.screenSeq || r.screeningStartAt) break;
+        const ready = [...new Set([...(r.screenReady ?? []), me.id])];
+        r.screenReady = ready;
+        if (s.players.every((p) => !this.isConnected(p.id) || ready.includes(p.id))) this.startScreening(r.screenSeq);
+        break;
+      }
+
       case 'replayScreening':
         host();
         phase('screening');
-        s.round!.screeningStartAt = Date.now() + 3000;
+        this.beginScreening();
         break;
 
       case 'nextScreening': {
@@ -632,7 +750,7 @@ export class Game {
         const r = s.round!;
         if (r.screeningIndex >= r.screeningOrder.length - 1) throw new GameError('Bu son gruptu');
         r.screeningIndex += 1;
-        r.screeningStartAt = Date.now() + 3500;
+        this.beginScreening();
         break;
       }
 
@@ -656,7 +774,7 @@ export class Game {
         throw new GameError('Bilinmeyen işlem');
     }
     this.changed();
-    return undefined;
+    return result;
   }
 
   private script(): Script {
@@ -752,6 +870,92 @@ export class Game {
     const owner = this.player(winner.playerId);
     if (owner) owner.score += SELECTION_BONUS;
     this.startProcessing();
+    // work done ahead of time on other videos makes way for the winner; the pool is queued again after it
+    s.jobs = s.jobs.filter((j) => !j.prep);
+    this.prefetch();
+  }
+
+  // ---------------------------------------------------------------- processing ahead of time
+
+  private fastWorkerOnline(): boolean {
+    const now = Date.now();
+    return [...this.workers.values()].some((w) => w.fast && now - w.lastSeen < WORKER_ONLINE_MS);
+  }
+
+  /** The video with the most votes so far (ties: the one submitted first). */
+  private voteLeader(): Submission | undefined {
+    const r = this.state.round;
+    if (this.state.phase !== 'vote' || !r) return undefined;
+    const tally = new Map<string, number>();
+    for (const id of Object.values(r.votes)) tally.set(id, (tally.get(id) ?? 0) + 1);
+    let best: Submission | undefined;
+    let top = 0;
+    for (const sub of this.state.submissions) {
+      const n = tally.get(sub.id) ?? 0;
+      if (n > top) {
+        top = n;
+        best = sub;
+      }
+    }
+    return best;
+  }
+
+  private clipCached(sub: Submission): boolean {
+    const dir = path.join(config.clipsDir, clipKey(sub));
+    return fs.existsSync(path.join(dir, 'clip.mp4')) && fs.existsSync(path.join(dir, 'script.json'));
+  }
+
+  private newJob(sub: Submission, prep?: Job['prep']): Job {
+    return {
+      id: randomUUID(),
+      key: clipKey(sub),
+      youtubeId: sub.youtubeId,
+      url: watchUrl(sub.youtubeId),
+      start: sub.start,
+      end: sub.end,
+      lang: sub.lang,
+      speakers: sub.speakers,
+      status: 'queued',
+      updatedAt: Date.now(),
+      prep,
+    };
+  }
+
+  /**
+   * Processes likely winners before the vote ends, so the script is ready sooner: the video leading
+   * the vote (even on the phone), and with a fast worker online every video in the pool. Only one
+   * leader job waits in the queue at a time, so a changing lead doesn't pile up work on the phone.
+   */
+  private prefetch(): boolean {
+    const s = this.state;
+    let changed = false;
+    const pool = new Set(s.submissions.map(clipKey));
+    const leader = this.voteLeader();
+    const leaderKey = leader ? clipKey(leader) : undefined;
+    s.jobs = s.jobs.filter((j) => {
+      const stale = j.prep && j.status === 'queued' && (!pool.has(j.key) || (j.prep === 'leader' && j.key !== leaderKey));
+      if (stale) changed = true;
+      return !stale;
+    });
+    const wanted: [Submission, NonNullable<Job['prep']>][] = [];
+    if (leader) wanted.push([leader, 'leader']);
+    if (this.fastWorkerOnline()) for (const sub of s.submissions) wanted.push([sub, 'pool']);
+    for (const [sub, prep] of wanted) {
+      const key = clipKey(sub);
+      if (this.failedPrep.has(key)) continue;
+      const existing = s.jobs.find((j) => j.key === key);
+      if (existing) {
+        if (prep === 'leader' && existing.prep === 'pool') {
+          existing.prep = 'leader';
+          changed = true;
+        }
+        continue;
+      }
+      if (this.clipCached(sub)) continue;
+      s.jobs.push(this.newJob(sub, prep));
+      changed = true;
+    }
+    return changed;
   }
 
   // ---------------------------------------------------------------- processing jobs
@@ -777,23 +981,22 @@ export class Game {
         // fall through and process again
       }
     }
+    this.failedPrep.delete(key);
     let job = s.jobs.find((j) => j.key === key);
-    if (!job) {
-      job = {
-        id: randomUUID(),
-        key,
-        youtubeId: sub.youtubeId,
-        url: watchUrl(sub.youtubeId),
-        start: sub.start,
-        end: sub.end,
-        lang: sub.lang,
-        speakers: sub.speakers,
-        status: 'queued',
-        updatedAt: Date.now(),
-      };
+    if (job) delete job.prep; // already being worked on ahead of time: now it is needed
+    else {
+      job = this.newJob(sub);
       s.jobs.push(job);
     }
-    r.clip = { key, status: 'queued', stage: 'queued', progress: 0, jobId: job.id };
+    const running = job.status === 'claimed';
+    r.clip = {
+      key,
+      status: running ? 'processing' : 'queued',
+      stage: running ? job.stage ?? 'download' : 'queued',
+      progress: running ? job.progress ?? 0 : 0,
+      jobId: job.id,
+      workerName: running ? job.claimedBy : undefined,
+    };
     s.phase = 'processing';
   }
 
@@ -821,6 +1024,7 @@ export class Game {
     const now = Date.now();
     this.workers.set(name, { lastSeen: now, fast });
     const s = this.state;
+    if (this.prefetch()) this.changed();
     const pl = s.playlist;
     // listing a playlist takes a second or two, so whichever worker asks first does it
     if (canPlaylist && pl?.taskId && (!pl.claimedAt || now - pl.claimedAt > PLAYLIST_TASK_MS)) {
@@ -831,7 +1035,11 @@ export class Game {
       const fastOnline = [...this.workers.entries()].some(([n, w]) => n !== name && w.fast && now - w.lastSeen < WORKER_ONLINE_MS);
       if (fastOnline) return null; // leave the job for the faster machine
     }
-    const job = s.jobs.find((j) => j.status === 'queued' || now - j.updatedAt > STALE_JOB_MS);
+    // needed-now first, then the vote leader, then the rest of the pool (fast workers only)
+    const rank = (j: Job) => (j.prep === undefined ? 0 : j.prep === 'leader' ? 1 : 2);
+    const job = s.jobs
+      .filter((j) => (j.status === 'queued' || now - j.updatedAt > STALE_JOB_MS) && (fast || j.prep !== 'pool'))
+      .sort((a, b) => rank(a) - rank(b))[0];
     if (!job) return null;
     job.status = 'claimed';
     job.claimedBy = name;
@@ -907,7 +1115,7 @@ export class Game {
   /** Looks up a job; any call about it also proves its worker is still alive. */
   private job(id: string): Job {
     const job = this.state.jobs.find((j) => j.id === id);
-    if (!job) throw new GameError('İş bulunamadı');
+    if (!job) throw new JobGone('İş bulunamadı');
     if (job.claimedBy) {
       const w = this.workers.get(job.claimedBy);
       this.workers.set(job.claimedBy, { lastSeen: Date.now(), fast: w?.fast ?? false });
@@ -918,6 +1126,8 @@ export class Game {
   jobProgress(id: string, stage: unknown, progress: unknown): void {
     const job = this.job(id);
     job.updatedAt = Date.now();
+    job.stage = String(stage ?? job.stage ?? '');
+    job.progress = Math.min(1, Math.max(0, Number(progress) || 0));
     const clip = this.state.round?.clip;
     if (clip?.jobId === id) {
       clip.status = 'processing';
@@ -953,6 +1163,7 @@ export class Game {
 
   jobFail(id: string, error: unknown): void {
     const job = this.job(id);
+    if (job.prep) this.failedPrep.add(job.key);
     this.state.jobs = this.state.jobs.filter((j) => j.id !== id);
     const clip = this.state.round?.clip;
     if (clip?.jobId === job.id) {
@@ -1031,7 +1242,15 @@ export class Game {
   private requestAllMixes(): void {
     const r = this.state.round;
     if (!r) return;
-    for (const g of r.groups) if (g.mixStatus === 'none' || g.mixStatus === 'error') this.requestMix(g);
+    for (const g of r.groups) {
+      // a group that sent nothing (e.g. a latecomer who left) is not screened as plain music
+      if (!Object.keys(g.recordings).length) {
+        g.mixStatus = 'error';
+        g.mixError = 'Bu grup kayıt göndermedi';
+        continue;
+      }
+      if (g.mixStatus === 'none' || g.mixStatus === 'error') this.requestMix(g);
+    }
     this.checkMixingDone();
   }
 
@@ -1078,7 +1297,7 @@ export class Game {
     if (!track) throw new GameError('Bu grupta rolün yok');
     const clipFile = path.join(config.clipsDir, r.clip.key, 'clip.mp4');
     const outName = `preview-${playerId}.mp4`;
-    const run = this.mixChain.then(() => mixGroup(clipFile, path.join(config.mixesDir, r.id, outName), [track]));
+    const run = this.mixChain.then(() => mixGroup(clipFile, { video: path.join(config.mixesDir, r.id, outName) }, [track]));
     this.mixChain = run.catch(() => {});
     await run;
     return `/media/mixes/${r.id}/${outName}?v=${Date.now()}`;
@@ -1097,9 +1316,9 @@ export class Game {
       if (track) tracks.push(track);
     }
     const clipFile = path.join(config.clipsDir, r.clip.key, 'clip.mp4');
-    const out = path.join(config.mixesDir, r.id, `${g.id}.mp4`);
+    const dir = path.join(config.mixesDir, r.id);
     try {
-      await mixGroup(clipFile, out, tracks);
+      await mixGroup(clipFile, { video: path.join(dir, `${g.id}.mp4`), audio: path.join(dir, `${g.id}.m4a`) }, tracks);
       g.mixStatus = 'ready';
       g.mixVersion += 1;
     } catch (e) {
@@ -1124,8 +1343,28 @@ export class Game {
     if (!ready.length) return; // all failed: host sees the errors and can retry
     r.screeningOrder = shuffle(ready.map((g) => g.id));
     r.screeningIndex = 0;
-    r.screeningStartAt = Date.now() + 4000;
     s.phase = 'screening';
+    this.beginScreening();
+  }
+
+  /** A group's screening starts once everyone's player has loaded, or after SCREEN_WAIT_MS. */
+  private beginScreening(): void {
+    const r = this.state.round!;
+    r.screenSeq = (r.screenSeq ?? 0) + 1;
+    r.screenReady = [];
+    delete r.screeningStartAt;
+    const seq = r.screenSeq;
+    clearTimeout(this.screenTimer);
+    this.screenTimer = setTimeout(() => this.startScreening(seq), SCREEN_WAIT_MS);
+    this.screenTimer.unref?.();
+  }
+
+  private startScreening(seq: number): void {
+    const r = this.state.round;
+    if (this.state.phase !== 'screening' || !r || r.screenSeq !== seq || r.screeningStartAt) return;
+    clearTimeout(this.screenTimer);
+    r.screeningStartAt = Date.now() + SCREEN_COUNTDOWN_MS;
+    this.changed();
   }
 
   // ---------------------------------------------------------------- results
@@ -1186,6 +1425,7 @@ export class Game {
       workerOnline: this.workerOnline(),
       passwordRequired: !!config.gamePassword,
       maxClipSeconds: config.maxClipSeconds,
+      publicUrl: config.publicUrl || null,
       playlist: s.playlist
         ? {
             url: s.playlist.url,
@@ -1204,6 +1444,9 @@ export class Game {
     const groups: GroupView[] = r.groups.map((g) => {
       const pos = r.screeningOrder.indexOf(g.id);
       const visible = (meId && g.members.includes(meId)) || (pos >= 0 && pos <= screenedUpTo);
+      // the next group's sound may preload during rating; it is not shown anywhere until its turn
+      const preload = phase === 'screening' && pos === r.screeningIndex + 1;
+      const ready = g.mixStatus === 'ready';
       return {
         id: g.id,
         index: g.index,
@@ -1214,7 +1457,8 @@ export class Game {
         recorded: Object.keys(g.recordings),
         mixStatus: g.mixStatus,
         mixError: g.mixError,
-        mixUrl: visible && g.mixStatus === 'ready' ? `/media/mixes/${r.id}/${g.id}.mp4?v=${g.mixVersion}` : undefined,
+        mixUrl: visible && ready ? `/media/mixes/${r.id}/${g.id}.mp4?v=${g.mixVersion}` : undefined,
+        mixAudioUrl: (visible || preload) && ready ? `/media/mixes/${r.id}/${g.id}.m4a?v=${g.mixVersion}` : undefined,
         takeStartAt: g.takeStartAt,
         lineCursor: g.lineCursor ?? 0,
         lineTake: r.script && lineTakeActive(g, r.script) ? g.lineTake : undefined,
@@ -1250,6 +1494,8 @@ export class Game {
       screeningOrder: r.screeningOrder,
       screeningIndex: r.screeningIndex,
       screeningStartAt: r.screeningStartAt,
+      screenSeq: r.screenSeq ?? 0,
+      screenReadyCount: r.screenReady?.length ?? 0,
       ratedBy,
       myRatings,
       results: phase === 'results' ? r.results : undefined,

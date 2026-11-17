@@ -97,7 +97,13 @@ export function send(action: Action): Promise<unknown> {
 
 // ---------------------------------------------------------------- toasts
 
-type ToastListener = (msg: string) => void;
+/** A button inside a toast, e.g. "Geri al". */
+export interface ToastAction {
+  label: string;
+  run: () => void;
+}
+
+type ToastListener = (msg: string, action?: ToastAction) => void;
 const toastListeners = new Set<ToastListener>();
 
 export function onToast(fn: ToastListener): () => void {
@@ -105,8 +111,8 @@ export function onToast(fn: ToastListener): () => void {
   return () => toastListeners.delete(fn);
 }
 
-export function toast(msg: string): void {
-  for (const fn of toastListeners) fn(msg);
+export function toast(msg: string, action?: ToastAction): void {
+  for (const fn of toastListeners) fn(msg, action);
 }
 
 /** Sends an action and shows any error as a toast. */

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -115,7 +116,9 @@ def download(job: dict, work: Path) -> Path:
         "-f", "bv*[height<=480][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480]/b",
         "--merge-output-format", "mp4",
         "--download-sections", f"*{float(job['start']):.2f}-{float(job['end']):.2f}",
+        # exact cuts need one re-encode; ffmpeg's default x264 preset is slow on a phone CPU
         "--force-keyframes-at-cuts",
+        "--downloader-args", "ffmpeg_o:-c:v libx264 -preset veryfast -crf 25 -c:a aac -b:a 192k",
         "-o", str(work / "source.%(ext)s"),
     )
     args.append(job["url"])
@@ -134,17 +137,24 @@ def probe(path: Path) -> dict:
 # ----------------------------------------------------------------------------- separation
 
 _demucs = None
+# models are loaded once and kept; the warm-up thread and a job may ask at the same time
+_model_lock = threading.Lock()
 
 
 def _demucs_model():
     global _demucs
-    if _demucs is None:
-        from demucs.pretrained import get_model
+    with _model_lock:
+        if _demucs is None:
+            from demucs.pretrained import get_model
 
-        model = get_model(os.environ.get("DEMUCS_MODEL", "htdemucs"))
-        model.eval()
-        _demucs = model
+            model = get_model(os.environ.get("DEMUCS_MODEL", "htdemucs"))
+            model.eval()
+            _demucs = model
     return _demucs
+
+
+def _slow() -> bool:
+    return device() != "cuda"
 
 
 def separate(mix_wav: Path, work: Path) -> tuple[Path, Path]:
@@ -164,7 +174,9 @@ def separate(mix_wav: Path, work: Path) -> tuple[Path, Path]:
     with torch.no_grad():
         sources = apply_model(
             model, ((mix - mean) / std)[None], device=device(),
-            shifts=1, split=True, overlap=0.25, progress=False,
+            shifts=1, split=True, progress=False,
+            # less overlap between the 8-second pieces: ~15% less work on a CPU, barely audible
+            overlap=float(os.environ.get("DEMUCS_OVERLAP") or (0.1 if _slow() else 0.25)),
         )[0]
     sources = sources * std + mean
     vi = model.sources.index("vocals")
@@ -182,6 +194,11 @@ _whisper = None
 
 
 def _whisper_model(force_cpu: bool = False):
+    with _model_lock:
+        return _load_whisper(force_cpu)
+
+
+def _load_whisper(force_cpu: bool):
     global _whisper
     if _whisper is not None and not force_cpu:
         return _whisper
@@ -215,10 +232,12 @@ def load_16k(speech_wav: Path, work: Path):
 
 
 def transcribe(audio16k, lang: str | None) -> list[dict]:
-    def go(model) -> list[dict]:
+    def go(model, on_cpu: bool) -> list[dict]:
+        # one guess per step instead of five on a CPU: much faster, slightly less accurate
+        beam = int(os.environ.get("WHISPER_BEAM") or (1 if on_cpu else 5))
         segments, _info = model.transcribe(
             audio16k, language=lang or None, word_timestamps=True, vad_filter=True,
-            beam_size=5, condition_on_previous_text=False,
+            beam_size=beam, condition_on_previous_text=False,
         )
         words = []
         for si, seg in enumerate(segments):
@@ -229,12 +248,12 @@ def transcribe(audio16k, lang: str | None) -> list[dict]:
         return words
 
     try:
-        return go(_whisper_model())
+        return go(_whisper_model(), _slow())
     except Exception as e:  # GPU runtime problems (missing cuDNN etc.): fall back to the CPU
         if device() != "cuda":
             raise
         print(f"[worker] Whisper GPU'da çalışmadı, CPU'ya geçiliyor: {e}", file=sys.stderr)
-        return go(_whisper_model(force_cpu=True))
+        return go(_whisper_model(force_cpu=True), True)
 
 
 # ----------------------------------------------------------------------------- diarization
@@ -248,6 +267,11 @@ def _fetch(url: str, dest: Path) -> None:
 
 
 def diarization_models() -> tuple[Path, Path]:
+    with _model_lock:
+        return _diarization_files()
+
+
+def _diarization_files() -> tuple[Path, Path]:
     root = MODELS / "diarization"
     seg = root / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
     if not seg.exists():
@@ -375,6 +399,15 @@ def build_lines(words: list[dict], diar: list[tuple[float, float, int]], speaker
 
 
 # ----------------------------------------------------------------------------- whole job
+
+def warmup() -> None:
+    """Loads (and on first use downloads) every model, so the first clip of the night doesn't wait for it."""
+    t0 = time.perf_counter()
+    _demucs_model()
+    _whisper_model()
+    diarization_models()
+    print(f"[worker] modeller hazır ({time.perf_counter() - t0:.0f} sn)")
+
 
 def process(job: dict, work: Path, progress: Progress) -> tuple[Path, dict, dict]:
     """Runs every step. Returns (clip.mp4, script, seconds spent per step)."""

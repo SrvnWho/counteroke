@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react';
 import { PHASE_LABELS } from '../../shared/constants.ts';
 import type { GameView } from '../../shared/types.ts';
+import { useAlerts, useSoundSetting } from './alerts.ts';
 import { act, onToast, socket } from './net.ts';
+import type { ToastAction } from './net.ts';
 import { Join } from './screens/Join.tsx';
 import { Lobby } from './screens/Lobby.tsx';
 import { Submit } from './screens/Submit.tsx';
@@ -36,13 +38,13 @@ function useGameState(): { g: GameView | null; connected: boolean } {
 }
 
 function Toasts() {
-  const [items, setItems] = useState<{ id: number; msg: string }[]>([]);
+  const [items, setItems] = useState<{ id: number; msg: string; action?: ToastAction }[]>([]);
   useEffect(
     () =>
-      onToast((msg) => {
+      onToast((msg, action) => {
         const id = Date.now() + Math.random();
-        setItems((x) => [...x, { id, msg }]);
-        setTimeout(() => setItems((x) => x.filter((i) => i.id !== id)), 4500);
+        setItems((x) => [...x, { id, msg, action }]);
+        setTimeout(() => setItems((x) => x.filter((i) => i.id !== id)), action ? 8000 : 4500);
       }),
     [],
   );
@@ -50,9 +52,37 @@ function Toasts() {
     <div className="toasts">
       {items.map((t) => (
         <div key={t.id} className="toast">
-          {t.msg}
+          <span>{t.msg}</span>
+          {t.action && (
+            <button
+              className="small"
+              onClick={() => {
+                t.action!.run();
+                setItems((x) => x.filter((i) => i.id !== t.id));
+              }}
+            >
+              {t.action.label}
+            </button>
+          )}
         </div>
       ))}
+    </div>
+  );
+}
+
+/** Shown when the connection to the server drops for more than a moment. */
+function ConnectionBanner({ connected }: { connected: boolean }) {
+  const [show, setShow] = useState(false);
+  useEffect(() => {
+    if (connected) return setShow(false);
+    const id = window.setTimeout(() => setShow(true), 1500); // ignore blips
+    return () => window.clearTimeout(id);
+  }, [connected]);
+  if (!show) return null;
+  return (
+    <div className="conn-banner" role="alert">
+      <span className="spinner" aria-hidden /> Sunucuyla bağlantı koptu, yeniden bağlanılıyor… Bu sırada yaptıkların
+      gönderilemez.
     </div>
   );
 }
@@ -60,6 +90,7 @@ function Toasts() {
 function TopBar({ g, connected }: { g: GameView; connected: boolean }) {
   const players = [...g.players].sort((a, b) => b.score - a.score);
   const [editing, setEditing] = useState(false);
+  const [sound, setSound] = useSoundSetting();
   return (
     <header className="topbar">
       {editing && <ProfileDialog g={g} onClose={() => setEditing(false)} />}
@@ -102,6 +133,14 @@ function TopBar({ g, connected }: { g: GameView; connected: boolean }) {
         <span className="conn" title={g.workerOnline ? 'Ses işleyici bağlı' : 'Ses işleyici bağlı değil'}>
           <i className={`dot ${g.workerOnline ? 'ok' : 'warn'}`} /> stüdyo
         </span>
+        <button
+          className="ghost small icon-btn"
+          onClick={() => setSound(!sound)}
+          title={sound ? 'Uyarı seslerini kapat' : 'Uyarı seslerini aç'}
+          aria-label={sound ? 'Uyarı seslerini kapat' : 'Uyarı seslerini aç'}
+        >
+          {sound ? '🔔' : '🔕'}
+        </button>
         {g.me?.isHost && (
           <button
             className="ghost small"
@@ -142,6 +181,7 @@ function Screen({ g }: { g: GameView }) {
 
 export function App() {
   const { g, connected } = useGameState();
+  useAlerts(g);
   if (!g) {
     return (
       <div className="center-screen">
@@ -162,6 +202,7 @@ export function App() {
   }
   return (
     <div className="app">
+      <ConnectionBanner connected={connected} />
       <TopBar g={g} connected={connected} />
       <main className="main">
         <Screen g={g} />

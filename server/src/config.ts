@@ -20,6 +20,8 @@ export const config = {
   /** Optional password players must type to join. Empty = no password. */
   gamePassword: process.env.GAME_PASSWORD ?? '',
   maxClipSeconds: Number(process.env.MAX_CLIP_SECONDS ?? 120),
+  /** fixed address friends open, e.g. https://counteroke.example.com (shown in the lobby) */
+  publicUrl: (process.env.PUBLIC_URL ?? '').trim().replace(/\/+$/, ''),
   /** clips and scene videos unused this many days are deleted; 0 keeps them forever */
   keepDays: Math.max(0, Number(process.env.KEEP_DAYS ?? 7) || 0),
   ffmpeg: process.env.FFMPEG ?? 'ffmpeg',

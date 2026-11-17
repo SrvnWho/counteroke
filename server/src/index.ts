@@ -10,7 +10,7 @@ import type { Socket } from 'socket.io';
 import type { Ack, Action, JoinResult, Script } from '../../shared/types.ts';
 import { cleanup } from './cleanup.ts';
 import { config } from './config.ts';
-import { Game, GameError } from './game.ts';
+import { Game, GameError, JobGone } from './game.ts';
 
 for (const dir of [config.dataDir, config.clipsDir, config.recordingsDir, config.mixesDir]) {
   fs.mkdirSync(dir, { recursive: true });
@@ -28,6 +28,7 @@ const game = new Game(() => {
   setTimeout(() => {
     broadcastQueued = false;
     for (const socket of io.of('/').sockets.values()) socket.emit('state', game.view(socket.data.playerId ?? null));
+    dispatch(); // something changed: maybe there is work for a waiting worker now
   }, 25);
 });
 
@@ -164,16 +165,63 @@ function wrap(fn: (req: Request, res: Response) => unknown | Promise<unknown>) {
       const out = await fn(req, res);
       if (!res.headersSent) res.json({ ok: true, data: out ?? null });
     } catch (e) {
-      if (!res.headersSent) res.status(400).json({ ok: false, error: errorMessage(e) });
+      if (!res.headersSent) res.status(e instanceof JobGone ? 410 : 400).json({ ok: false, error: errorMessage(e) });
     }
   };
 }
 
+// Long polling: a worker's request waits (up to `wait` seconds) until there is work, so an idle
+// phone worker isn't woken every 2 seconds and a new job starts at once.
+interface Waiter {
+  name: string;
+  fast: boolean;
+  canPlaylist: boolean;
+  res: Response;
+  timer: NodeJS.Timeout;
+}
+const waiters = new Set<Waiter>();
+
+function dropWaiter(w: Waiter): void {
+  waiters.delete(w);
+  clearTimeout(w.timer);
+}
+
+function dispatch(): void {
+  // fast (GPU) workers get the first pick
+  for (const w of [...waiters].sort((a, b) => Number(b.fast) - Number(a.fast))) {
+    const job = game.nextJob(w.name, w.fast, w.canPlaylist); // also keeps the waiting worker "online"
+    if (!job) continue;
+    dropWaiter(w);
+    w.res.json(job);
+  }
+}
+setInterval(dispatch, 5000).unref();
+
 app.get('/api/worker/next', workerAuth, (req, res) => {
-  const caps = String(req.query.caps ?? '').split(',');
-  const job = game.nextJob(String(req.query.name ?? 'worker').slice(0, 40), req.query.fast === '1', caps.includes('playlist'));
-  if (job) res.json(job);
-  else res.status(204).end();
+  const name = String(req.query.name ?? 'worker').slice(0, 40);
+  const fast = req.query.fast === '1';
+  const canPlaylist = String(req.query.caps ?? '').split(',').includes('playlist');
+  const wait = Math.min(30, Math.max(0, Number(req.query.wait) || 0));
+  const job = game.nextJob(name, fast, canPlaylist);
+  if (job) return void res.json(job);
+  if (!wait) return void res.status(204).end();
+  for (const old of waiters) {
+    if (old.name !== name) continue; // one waiting request per worker
+    dropWaiter(old);
+    old.res.status(204).end();
+  }
+  const w: Waiter = {
+    name,
+    fast,
+    canPlaylist,
+    res,
+    timer: setTimeout(() => {
+      dropWaiter(w);
+      res.status(204).end();
+    }, wait * 1000),
+  };
+  waiters.add(w);
+  res.on('close', () => dropWaiter(w));
 });
 
 app.post('/api/worker/playlist/:id', workerAuth, express.json({ limit: '2mb' }), wrap((req) => {
@@ -199,7 +247,10 @@ app.post('/api/worker/jobs/:id/fail', workerAuth, express.json(), wrap((req) => 
 // ------------------------------------------------------------------ media + web
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
-app.use('/media/clips', express.static(config.clipsDir, { maxAge: '1h', index: false }));
+// Media URLs never change content (clips are keyed by video+range, mixes carry ?v=version), so
+// browsers - and Cloudflare in front of the phone - may keep them instead of asking the phone again.
+const LONG_CACHE = 'public, max-age=86400, immutable';
+app.use('/media/clips', express.static(config.clipsDir, { index: false, setHeaders: (res) => res.setHeader('Cache-Control', LONG_CACHE) }));
 app.use(
   '/media/mixes',
   (req, res, next) => {
@@ -208,13 +259,42 @@ app.use(
     if (name) res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
     next();
   },
-  express.static(config.mixesDir, { index: false }),
+  express.static(config.mixesDir, { index: false, setHeaders: (res) => res.setHeader('Cache-Control', LONG_CACHE) }),
 );
 
+const ASSETS = path.join(config.webDist, 'assets');
+const ASSET_CACHE = 'public, max-age=31536000, immutable'; // file names carry a content hash
+const PRECOMPRESSED = [
+  ['br', '.br'],
+  ['gzip', '.gz'],
+] as const;
+
 if (fs.existsSync(path.join(config.webDist, 'index.html'))) {
-  app.use(express.static(config.webDist, { index: false }));
+  // the build writes .br/.gz copies, so the phone never compresses anything at runtime
+  app.use('/assets', (req, res, next) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+    const file = path.resolve(ASSETS, `.${req.path}`);
+    if (!file.startsWith(ASSETS + path.sep)) return next();
+    const accepts = String(req.get('accept-encoding') ?? '');
+    for (const [encoding, ext] of PRECOMPRESSED) {
+      if (!accepts.includes(encoding) || !fs.existsSync(file + ext)) continue;
+      res.setHeader('Content-Encoding', encoding);
+      res.setHeader('Vary', 'Accept-Encoding');
+      res.setHeader('Cache-Control', ASSET_CACHE);
+      res.type(path.extname(file));
+      return res.sendFile(file + ext);
+    }
+    next();
+  });
+  app.use(
+    express.static(config.webDist, {
+      index: false,
+      setHeaders: (res, file) => file.startsWith(ASSETS + path.sep) && res.setHeader('Cache-Control', ASSET_CACHE),
+    }),
+  );
   app.use((req, res, next) => {
     if (req.method !== 'GET' || /^\/(api|media|socket\.io)\//.test(req.path)) return next();
+    res.setHeader('Cache-Control', 'no-cache');
     res.sendFile(path.join(config.webDist, 'index.html'));
   });
 } else {
@@ -247,6 +327,7 @@ setInterval(runCleanup, 6 * 3600_000).unref();
 
 server.listen(config.port, config.host, () => {
   console.log(`counteroke sunucusu: http://localhost:${config.port}`);
+  if (config.publicUrl) console.log(`Davet linki: ${config.publicUrl}`);
   if (config.workerToken === 'counteroke-dev') {
     console.log('Uyarı: WORKER_TOKEN ayarlanmamış, varsayılan anahtar kullanılıyor.');
   }

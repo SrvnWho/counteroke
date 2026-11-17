@@ -2,41 +2,133 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type { GameView, GroupView } from '../../../shared/types.ts';
 import { act, serverNow } from '../net.ts';
-import { charColor, groupLabel, mixDownload, useNow } from '../util.ts';
+import { charColor, groupLabel, mixDownload, storedNumber, storeNumber, useNow } from '../util.ts';
 import { Avatar, Countdown, PlayerTag } from '../ui.tsx';
 
-/** Starts the video at the same server moment for everyone. */
-function SyncedVideo({ src, startAt, onEnded }: { src?: string; startAt?: number; onEnded: () => void }) {
-  const ref = useRef<HTMLVideoElement>(null);
+const VOLUME_KEY = 'counteroke.galaVolume';
+
+/**
+ * The gala player. The clip's picture is already in the browser from the recording screen, so it
+ * plays muted with the group's sound as a small separate file. Everyone reports when both have
+ * loaded, the server then sets one start time, and a player who falls behind (buffering) is pulled
+ * back in sync. Mixes without a sound file fall back to the full video.
+ */
+function GalaPlayer({ g, group, onEnded }: { g: GameView; group: GroupView; onEnded: () => void }) {
+  const r = g.round!;
+  const [audioFailed, setAudioFailed] = useState(false);
+  const split = !!group.mixAudioUrl && !!r.clip?.videoUrl && !audioFailed;
+  const videoSrc = split ? r.clip!.videoUrl : group.mixUrl;
+  const video = useRef<HTMLVideoElement>(null);
+  const audio = useRef<HTMLAudioElement>(null);
+  const box = useRef<HTMLDivElement>(null);
+  const reported = useRef(0);
   const [blocked, setBlocked] = useState(false);
+  const [volume, setVolume] = useState(() => storedNumber(VOLUME_KEY, 1));
+  const startAt = r.screeningStartAt;
+  const seq = r.screenSeq;
   const now = useNow(250);
+  const master = () => (split ? audio.current : video.current);
+
+  // tell the server once our player can play this group's film
+  useEffect(() => {
+    if (startAt) return;
+    const id = window.setInterval(() => {
+      const m = master();
+      const v = video.current;
+      if (!m || !v || reported.current === seq) return;
+      if (m.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA && v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        reported.current = seq;
+        act({ type: 'screenReady', seq });
+      }
+    }, 250);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seq, startAt, split]);
 
   const go = useCallback(() => {
-    const v = ref.current;
-    if (!v || !startAt) return;
+    const m = master();
+    const v = video.current;
+    if (!m || !v || !startAt) return;
     const late = (serverNow() - startAt) / 1000;
-    if (late > 0.3 && (!v.duration || late < v.duration)) v.currentTime = late;
-    v.play().then(
+    if (late > 0.3 && (!m.duration || late < m.duration)) {
+      m.currentTime = late;
+      if (split) v.currentTime = late;
+    }
+    const plays = split ? [m.play(), v.play()] : [m.play()];
+    Promise.all(plays).then(
       () => setBlocked(false),
       () => setBlocked(true),
     );
-  }, [startAt]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startAt, split]);
 
+  // start together at the server's moment
   useEffect(() => {
-    const v = ref.current;
-    if (!v || !src || !startAt) return;
+    const m = master();
+    const v = video.current;
+    if (!m || !v) return;
+    m.pause();
     v.pause();
+    m.currentTime = 0;
     v.currentTime = 0;
+    if (!startAt) return;
     const timer = window.setTimeout(go, Math.max(0, startAt - serverNow()));
     return () => window.clearTimeout(timer);
-  }, [src, startAt, go]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startAt, seq, split, go]);
 
-  const wait = startAt ? (startAt - (now + (serverNow() - Date.now()))) / 1000 : 0;
+  // stay on the shared clock; the picture follows the sound
+  useEffect(() => {
+    if (!startAt) return;
+    const id = window.setInterval(() => {
+      const m = master();
+      const v = video.current;
+      if (!m || !v || m.paused || m.ended) return;
+      const expected = (serverNow() - startAt) / 1000;
+      if (expected > 0 && (!m.duration || expected < m.duration - 0.5) && Math.abs(m.currentTime - expected) > 0.4) {
+        m.currentTime = expected;
+      }
+      if (split) {
+        if (Math.abs(v.currentTime - m.currentTime) > 0.15) v.currentTime = m.currentTime;
+        if (v.paused && !v.ended) void v.play().catch(() => {});
+      }
+    }, 500);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startAt, split]);
+
+  useEffect(() => {
+    const m = master();
+    if (m) m.volume = volume;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [volume, split]);
+
+  const wait = startAt ? (startAt - (now + (serverNow() - Date.now()))) / 1000 : null;
+  const connected = g.players.filter((p) => p.connected).length;
   return (
     <div className="marquee">
-      <div className="video-wrap">
-        <video ref={ref} src={src} playsInline controls className="clip big-clip" onEnded={onEnded} />
-        {wait > 0 && (
+      <div className="video-wrap" ref={box}>
+        <video
+          ref={video}
+          src={videoSrc}
+          muted={split}
+          playsInline
+          preload="auto"
+          className="clip big-clip"
+          onEnded={split ? undefined : onEnded}
+        />
+        {split && (
+          <audio ref={audio} src={group.mixAudioUrl} preload="auto" onEnded={onEnded} onError={() => setAudioFailed(true)} />
+        )}
+        {wait === null && (
+          <div className="overlay dim">
+            <div className="gala-wait">
+              <div className="reel" />
+              Herkesin videosu yükleniyor… ({Math.min(r.screenReadyCount, connected)}/{connected})
+            </div>
+          </div>
+        )}
+        {wait !== null && wait > 0 && (
           <div className="overlay dim">
             <Countdown seconds={wait} />
           </div>
@@ -46,6 +138,27 @@ function SyncedVideo({ src, startAt, onEnded }: { src?: string; startAt?: number
             ▶ Oynat
           </button>
         )}
+      </div>
+      <div className="gala-controls">
+        <label className="volume">
+          🔊
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.05}
+            value={volume}
+            aria-label="Ses düzeyi"
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              setVolume(v);
+              storeNumber(VOLUME_KEY, v);
+            }}
+          />
+        </label>
+        <button className="ghost small" onClick={() => void box.current?.requestFullscreen?.()}>
+          ⛶ Tam ekran
+        </button>
       </div>
     </div>
   );
@@ -97,6 +210,8 @@ export function Screening({ g }: { g: GameView }) {
   useEffect(() => setEnded(false), [groupId, r.screeningStartAt]);
   if (!group) return null;
   const last = r.screeningIndex >= r.screeningOrder.length - 1;
+  // the next group's sound loads while this one is being rated
+  const next = r.groups.find((x) => x.id === r.screeningOrder[r.screeningIndex + 1]);
   const raters = r.ratedBy[groupId]?.length ?? 0;
   const connected = g.players.filter((p) => p.connected).length;
   return (
@@ -112,7 +227,8 @@ export function Screening({ g }: { g: GameView }) {
           ))}
         </div>
       </div>
-      <SyncedVideo src={group.mixUrl} startAt={r.screeningStartAt} onEnded={() => setEnded(true)} />
+      <GalaPlayer key={group.id} g={g} group={group} onEnded={() => setEnded(true)} />
+      {next?.mixAudioUrl && <audio src={next.mixAudioUrl} preload="auto" hidden />}
       <div className="row">
         <Cast g={g} group={group} />
         <span style={{ marginLeft: 'auto' }}>

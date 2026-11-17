@@ -111,20 +111,27 @@ function run(cmd: string, args: string[]): Promise<void> {
   });
 }
 
-/** Renders the group's final video: original picture, music/effects, and all voices. */
-export async function mixGroup(clipFile: string, outFile: string, tracks: Track[]): Promise<void> {
-  fs.mkdirSync(path.dirname(outFile), { recursive: true });
-  const tmp = `${outFile}.tmp.mp4`;
-  const { graph } = buildFilterGraph(tracks);
+/**
+ * Renders the group's final video (original picture, music/effects and all voices) and, when asked,
+ * the same sound as a separate audio file. The picture is copied, never re-encoded.
+ */
+export async function mixGroup(clipFile: string, out: { video: string; audio?: string }, tracks: Track[]): Promise<void> {
+  fs.mkdirSync(path.dirname(out.video), { recursive: true });
+  const tmpVideo = `${out.video}.tmp.mp4`;
+  const tmpAudio = out.audio ? `${out.audio}.tmp.m4a` : undefined;
+  let { graph } = buildFilterGraph(tracks);
+  if (tmpAudio) graph += ';[aout]asplit=2[aoutv][aouta]';
   const args = ['-y', '-hide_banner', '-loglevel', 'error', '-i', clipFile];
   for (const t of tracks) args.push('-i', t.file);
   args.push(
     '-filter_complex', graph,
-    '-map', '0:v:0', '-map', '[aout]',
+    '-map', '0:v:0', '-map', tmpAudio ? '[aoutv]' : '[aout]',
     '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k',
     '-movflags', '+faststart',
-    tmp,
+    tmpVideo,
   );
+  if (tmpAudio) args.push('-map', '[aouta]', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', tmpAudio);
   await run(config.ffmpeg, args);
-  fs.renameSync(tmp, outFile);
+  fs.renameSync(tmpVideo, out.video);
+  if (tmpAudio && out.audio) fs.renameSync(tmpAudio, out.audio);
 }

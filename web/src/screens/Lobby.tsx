@@ -7,7 +7,7 @@ import { Avatar } from '../ui.tsx';
 
 export function Lobby({ g }: { g: GameView }) {
   const [editing, setEditing] = useState(false);
-  const link = window.location.origin;
+  const link = g.publicUrl ?? window.location.origin;
   const copy = () =>
     navigator.clipboard.writeText(link).then(
       () => toast('Link kopyalandı'),

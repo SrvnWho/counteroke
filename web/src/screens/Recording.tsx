@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { RefObject } from 'react';
 import { EFFECTS } from '../../../shared/constants.ts';
 import type { EffectId } from '../../../shared/constants.ts';
-import type { GameView } from '../../../shared/types.ts';
+import type { GameView, Script } from '../../../shared/types.ts';
+import { OriginalClip } from '../LiteYouTube.tsx';
 import { act, getSession, serverNow, toast } from '../net.ts';
-import { decodeTake, openMic, playPreview, recordTake, useMicLevel } from '../recorder.ts';
+import { audioCtx, decodeTake, openMic, playPreview, recordTake } from '../recorder.ts';
 import type { Take, TakeHandle } from '../recorder.ts';
+import { deleteTake, loadTakes, saveTake } from '../takeStore.ts';
 import { Teleprompter } from '../Teleprompter.tsx';
 import { Avatar, Countdown, PlayerTag } from '../ui.tsx';
 import { useLineTakes } from '../useLineTakes.ts';
@@ -38,6 +41,61 @@ function GroupStatus({ g }: { g: GameView }) {
   );
 }
 
+// The parts below redraw many times a second. Keeping them in their own small components means only
+// they redraw, not the whole recording screen (smoother on weak phones, no stutter while recording).
+
+/** Karaoke script that follows the video. */
+function LivePrompter(props: {
+  video: RefObject<HTMLVideoElement | null>;
+  script: Script;
+  mine: Set<number>;
+  names: Record<number, string>;
+}) {
+  const t = useVideoTime(props.video);
+  return <Teleprompter script={props.script} t={t} mine={props.mine} names={props.names} />;
+}
+
+/** Microphone level bar, updated straight in the page without re-rendering anything. */
+function MicMeter({ stream }: { stream: MediaStream }) {
+  const bar = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const c = audioCtx();
+    const source = c.createMediaStreamSource(stream);
+    const analyser = c.createAnalyser();
+    analyser.fftSize = 1024;
+    source.connect(analyser);
+    const data = new Float32Array(analyser.fftSize);
+    let raf = 0;
+    const tick = () => {
+      analyser.getFloatTimeDomainData(data);
+      let sum = 0;
+      for (const v of data) sum += v * v;
+      if (bar.current) bar.current.style.width = `${Math.round(Math.min(1, Math.sqrt(sum / data.length) * 4) * 100)}%`;
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      source.disconnect();
+    };
+  }, [stream]);
+  return (
+    <div className="meter" title="Mikrofon seviyesi">
+      <div ref={bar} />
+    </div>
+  );
+}
+
+/** 3-2-1 over the video until the given server time. */
+function CountdownOverlay({ to }: { to: number }) {
+  useNow(100);
+  return (
+    <div className="overlay dim">
+      <Countdown seconds={Math.max(0, (to - serverNow()) / 1000)} />
+    </div>
+  );
+}
+
 async function putAudio(path: string, roundId: string, blob: Blob, mime: string, trimMs: number) {
   const s = getSession();
   if (!s) throw new Error('Oturum yok');
@@ -58,12 +116,9 @@ export function Recording({ g }: { g: GameView }) {
   const meId = g.me!.id;
 
   const video = useRef<HTMLVideoElement>(null);
-  const t = useVideoTime(video);
-  const now = useNow(100);
 
   const [mic, setMic] = useState<MediaStream | null>(null);
   const [micError, setMicError] = useState('');
-  const level = useMicLevel(mic);
   const [mode, setModeState] = useState<Mode>(storedMode);
   const [uploading, setUploading] = useState(false);
   const [manualMs, setManualMs] = useState(() => storedNumber(SYNC_KEY, 0));
@@ -79,6 +134,7 @@ export function Recording({ g }: { g: GameView }) {
   const startTimer = useRef<number | undefined>(undefined);
   const stopPreview = useRef<(() => void) | null>(null);
   const seenTake = useRef<number | undefined>(group?.takeStartAt);
+  const fullKey = `${r.id}:${meId}:full`;
 
   const myChars = useMemo(
     () => new Set(Object.entries(group?.roles ?? {}).filter(([, p]) => p === meId).map(([c]) => Number(c))),
@@ -99,9 +155,29 @@ export function Recording({ g }: { g: GameView }) {
     mine: myChars,
     group,
     meId,
+    roundId: r.id,
     enabled: mode === 'lines' && stage === 'idle',
     onError: toast,
+    onRestored: (n) => toast(`Sayfa yenilenmeden önceki ${n} replik kaydın geri yüklendi`),
   });
+
+  // A whole-clip take kept in the browser comes back after a refresh.
+  useEffect(() => {
+    if (mode !== 'full') return;
+    let cancelled = false;
+    void loadTakes(fullKey).then(async (saved) => {
+      const tk = saved[0]?.[1];
+      if (cancelled || !tk || tk.autoTrimMs === undefined) return;
+      setTake({ blob: tk.blob, mime: tk.mime, autoTrimMs: tk.autoTrimMs });
+      setStage((st) => (st === 'idle' ? 'review' : st));
+      setVoice(await decodeTake(tk.blob).catch(() => null));
+      toast('Sayfa yenilenmeden önceki kaydın geri yüklendi');
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fullKey]);
 
   const busy = stage === 'countdown' || stage === 'recording' || lines.phase !== 'idle' || uploading || fxBusy;
 
@@ -147,6 +223,7 @@ export function Recording({ g }: { g: GameView }) {
     setTake(null);
     setVoice(null);
     setFxUrl(null);
+    void deleteTake(fullKey);
     setStage('countdown');
     setCountdownTo(atServerMs);
     window.clearTimeout(startTimer.current);
@@ -159,6 +236,7 @@ export function Recording({ g }: { g: GameView }) {
           handle.current = null;
           setTake(tk);
           setStage('review');
+          void saveTake(fullKey, { blob: tk.blob, mime: tk.mime, autoTrimMs: tk.autoTrimMs });
           setVoice(await decodeTake(tk.blob).catch(() => null));
         })
         .catch((e: Error) => {
@@ -218,28 +296,29 @@ export function Recording({ g }: { g: GameView }) {
     setFxUrl(null);
   };
 
-  /** What would be sent right now: the line takes merged, or the single full take. */
-  const current = (): { blob: Blob; mime: string; trimMs: number } | null => {
+  /** What would be sent right now: the line takes merged (and compressed), or the single full take. */
+  const current = async (): Promise<{ blob: Blob; mime: string; trimMs: number } | null> => {
     if (mode === 'lines') {
-      const wav = lines.wav();
-      return wav ? { blob: wav, mime: 'audio/wav', trimMs: manualMs } : null;
+      const file = await lines.encode();
+      return file ? { ...file, trimMs: manualMs } : null;
     }
     return take ? { blob: take.blob, mime: take.mime, trimMs: take.autoTrimMs + manualMs } : null;
   };
 
   const upload = async () => {
-    const c = current();
-    if (!c) return;
     stopPreview.current?.();
     lines.stopListening();
     setUploading(true);
     try {
+      const c = await current();
+      if (!c) return;
       await putAudio('/api/recording', r.id, c.blob, c.mime, c.trimMs);
       toast('Kaydın gönderildi 🎉');
       if (mode === 'full') {
         setTake(null);
         setVoice(null);
         setStage('idle');
+        void deleteTake(fullKey);
       }
     } catch (e) {
       toast(`Gönderilemedi: ${(e as Error).message}`);
@@ -250,13 +329,13 @@ export function Recording({ g }: { g: GameView }) {
 
   /** Renders your take with your effects on the server, without sending it. */
   const previewWithEffects = async () => {
-    const c = current();
-    if (!c) return;
     stopPreview.current?.();
     lines.stopListening();
     setFxBusy(true);
     setFxUrl(null);
     try {
+      const c = await current();
+      if (!c) return;
       const data = await putAudio('/api/preview', r.id, c.blob, c.mime, c.trimMs);
       setFxUrl(data?.url ?? null);
     } catch (e) {
@@ -278,8 +357,6 @@ export function Recording({ g }: { g: GameView }) {
     );
   }
 
-  const fullCountdown = Math.max(0, (countdownTo - (now + (serverNow() - Date.now()))) / 1000);
-  const lineCountdown = Math.max(0, (lines.countTo - (now + (serverNow() - Date.now()))) / 1000);
   const counting = stage === 'countdown' || lines.phase === 'countdown';
   const recording = stage === 'recording' || lines.phase === 'recording';
   const n = lines.lines.length;
@@ -322,15 +399,19 @@ export function Recording({ g }: { g: GameView }) {
       <section className="card stage">
         <div className="video-wrap">
           <video ref={video} src={r.clip?.videoUrl} playsInline controls={!busy && stage === 'idle'} className="clip" />
-          {counting && (
-            <div className="overlay dim">
-              <Countdown seconds={stage === 'countdown' ? fullCountdown : lineCountdown} />
-            </div>
-          )}
+          {counting && <CountdownOverlay to={stage === 'countdown' ? countdownTo : lines.countTo} />}
           {recording && <div className="rec-badge">KAYIT</div>}
           {lines.phase === 'following' && takeOwner && <div className="rec-badge follow">{takeOwner.name} okuyor</div>}
         </div>
-        <Teleprompter script={script} t={t} mine={myChars} names={names} />
+        <LivePrompter video={video} script={script} mine={myChars} names={names} />
+        {r.submission && !busy && (
+          <OriginalClip
+            key={mode === 'lines' ? curLine?.id : 'full'}
+            sub={r.submission}
+            at={mode === 'lines' && curLine ? curLine.start : 0}
+            label={mode === 'lines' && curLine ? '🔊 Bu repliğin orijinali' : '🔊 Orijinali dinle'}
+          />
+        )}
       </section>
 
       <aside className="card side">
@@ -367,9 +448,7 @@ export function Recording({ g }: { g: GameView }) {
             {micError && <p className="error">{micError}</p>}
           </>
         ) : (
-          <div className="meter" title="Mikrofon seviyesi">
-            <div style={{ width: `${Math.round(level * 100)}%` }} />
-          </div>
+          <MicMeter stream={mic} />
         )}
 
         {mic && (
@@ -503,7 +582,13 @@ export function Recording({ g }: { g: GameView }) {
             <button onClick={preview} disabled={!voice || busy}>
               ▶ Dinle (efektsiz)
             </button>
-            <button onClick={() => setStage('idle')} disabled={busy}>
+            <button
+              onClick={() => {
+                setStage('idle');
+                void deleteTake(fullKey);
+              }}
+              disabled={busy}
+            >
               Sil, tekrar kaydet
             </button>
           </div>

@@ -2,9 +2,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import type { GroupView, Script } from '../../shared/types.ts';
 import { act, serverNow } from './net.ts';
+import { encodeVoice } from './opus.ts';
 import { audioCtx, decodeTake, playPreview, recordTake } from './recorder.ts';
 import type { TakeHandle } from './recorder.ts';
-import { buildChunks, encodeWav, lineSpan, monoOf, placeTakes } from './takes.ts';
+import { dropOtherRounds, loadTakes, saveTake } from './takeStore.ts';
+import { buildChunks, lineSpan, monoOf, placeTakes } from './takes.ts';
 
 export type LinePhase = 'idle' | 'countdown' | 'recording' | 'following' | 'listening';
 
@@ -29,11 +31,14 @@ export function useLineTakes(opts: {
   mine: ReadonlySet<number>;
   group: GroupView | undefined;
   meId: string;
+  roundId: string;
   /** false while the player is busy in the other ("Tek seferde") mode */
   enabled: boolean;
   onError: (msg: string) => void;
+  onRestored?: (count: number) => void;
 }) {
-  const { script, video, mic, mine, group, meId, enabled, onError } = opts;
+  const { script, video, mic, mine, group, meId, roundId, enabled, onError, onRestored } = opts;
+  const storePrefix = `${roundId}:${meId}:line:`;
   const lines = script.lines;
   const chunks = useMemo(() => buildChunks(lines, mine, script.duration), [lines, script.duration, mine]);
   const chunkOf = (lineId: string) => chunks.find((c) => c.id === lineId);
@@ -68,6 +73,35 @@ export function useLineTakes(opts: {
     },
     [],
   );
+
+  // Takes saved in the browser come back after a refresh.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      await dropOtherRounds(roundId);
+      const saved = await loadTakes(storePrefix);
+      const restored: Record<string, Recorded> = {};
+      for (const [key, tk] of saved) {
+        const lineId = key.slice(storePrefix.length);
+        if (!lines.some((l) => l.id === lineId) || tk.at === undefined) continue;
+        try {
+          const buf = await decodeTake(tk.blob);
+          restored[lineId] = { samples: monoOf(buf), sampleRate: buf.sampleRate, at: tk.at };
+        } catch {
+          /* unreadable: skip it */
+        }
+      }
+      if (cancelled || !Object.keys(restored).length) return;
+      const next = { ...restored, ...takesRef.current };
+      takesRef.current = next;
+      setTakes(next);
+      onRestored?.(Object.keys(restored).length);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storePrefix]);
 
   // React to a line being started by its voice actor (possibly us).
   useEffect(() => {
@@ -110,9 +144,11 @@ export function useLineTakes(opts: {
           .then(async (tk) => {
             handle.current = null;
             const buf = await decodeTake(tk.blob);
+            const at = chunk.playFrom - tk.autoTrimMs / 1000;
+            void saveTake(storePrefix + line.id, { blob: tk.blob, mime: tk.mime, at });
             const next = {
               ...takesRef.current,
-              [line.id]: { samples: monoOf(buf), sampleRate: buf.sampleRate, at: chunk.playFrom - tk.autoTrimMs / 1000 },
+              [line.id]: { samples: monoOf(buf), sampleRate: buf.sampleRate, at },
             };
             takesRef.current = next;
             setTakes(next);
@@ -191,9 +227,10 @@ export function useLineTakes(opts: {
     });
   };
 
-  const wav = (): Blob | null => {
+  /** Our takes as one small file for upload (Opus where the browser can, else a 24 kHz WAV). */
+  const encode = async (): Promise<{ blob: Blob; mime: string } | null> => {
     const a = assemble();
-    return a ? new Blob([encodeWav(a.samples, a.sampleRate)], { type: 'audio/wav' }) : null;
+    return a ? encodeVoice(a.samples, a.sampleRate) : null;
   };
 
   return {
@@ -213,6 +250,6 @@ export function useLineTakes(opts: {
     finish: () => handle.current?.finish(),
     listen,
     stopListening: () => stopListen.current?.(),
-    wav,
+    encode,
   };
 }

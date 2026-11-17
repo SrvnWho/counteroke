@@ -1,4 +1,5 @@
 import type { GameView } from '../../../shared/types.ts';
+import { LiteYouTube } from '../LiteYouTube.tsx';
 import { act } from '../net.ts';
 import { fmtTime, playerName } from '../util.ts';
 
@@ -24,12 +25,7 @@ export function Vote({ g }: { g: GameView }) {
           const voted = r.myVote === s.id;
           return (
             <div key={s.id} className={`card vote-card ${voted ? 'voted' : ''}`}>
-              <iframe
-                src={`https://www.youtube-nocookie.com/embed/${s.youtubeId}?start=${Math.floor(s.start)}&end=${Math.ceil(s.end)}&rel=0&playsinline=1`}
-                title={s.title}
-                allow="autoplay; encrypted-media; picture-in-picture"
-                allowFullScreen
-              />
+              <LiteYouTube id={s.youtubeId} start={s.start} end={s.end} title={s.title} />
               {voted && <div className="stamp">OYUN BURADA</div>}
               <div className="title">{s.title}</div>
               <div className="muted small">
